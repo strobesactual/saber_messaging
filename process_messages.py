@@ -10,7 +10,6 @@
 #   - Flask app; safe under Gunicorn or standalone (dev)
 #   - Creates data directory/files on import to work with WSGI servers
 
-
 # === Standard Library / Third-Party Imports ==================================
 from flask import Flask, request, jsonify, Response, send_file
 import base64
@@ -83,162 +82,100 @@ def ensure_directories():
 # Make sure paths exist even under Gnuicorn (not just __main__)
 ensure_directories()
 
+
 # =============================================================================
-# Decoding Helpers (Field Selection/Normalization)
+# Decoding (fixed Globalstar layout)
 # -----------------------------------------------------------------------------
-# _choose_latlon: try multiple encodings (endianness + offset), prefer plausible
-#                 values and non-extreme latitudes; return rounded values + mode
-# _choose_alt:    handle endianness/overflow-ish payloads; clamp absurd values
-# _choose_timestamp: prefer plausible epoch seconds; derive local time from lon
+# Message format (17 bytes total):
+#   [0]   = burn byte 0x02 (ignore)
+#   [1:5] = latitude   (4B, big-endian)   -> lat = raw/1e5 - 90
+#   [5:9] = longitude  (4B, big-endian)   -> lon = raw/1e5 - 180
+#   [9:13]= altitude   (4B, big-endian)   -> alt_m = raw/100
+#   [13:17]= time UTC  (4B, big-endian)   -> HHMMSSCC  (we use HH:MM:SS)
 # =============================================================================
-def _choose_latlon(lat_bytes: bytes, lon_bytes: bytes):
-    # Prefer signed microdegrees (little-endian) first, then others. Avoid extreme latitudes when multiple are valid.
-    cands = [
-        ("microdeg_le",
-         int.from_bytes(lat_bytes, "little", signed=True)/1e7,
-         int.from_bytes(lon_bytes, "little", signed=True)/1e7),
-        ("microdeg_be",
-         int.from_bytes(lat_bytes, "big", signed=True)/1e7,
-         int.from_bytes(lon_bytes, "big", signed=True)/1e7),
-        ("offset_le",
-         int.from_bytes(lat_bytes, "little")/1e6 - 90,
-         int.from_bytes(lon_bytes, "little")/1e6 - 180),
-        ("offset_be",
-         int.from_bytes(lat_bytes, "big")/1e6 - 90,
-         int.from_bytes(lon_bytes, "big")/1e6 - 180),
-    ]
 
-    valid = [(m, lat, lon) for (m, lat, lon) in cands
-             if -90 <= lat <= 90 and -180 <= lon <= 180]
-    if not valid:
-        raise ValueError("Decode produced no valid lat/lon")
-    
-    # Prefer non-extreme latitudes; then smallest absolute latitude as tie-breaker
-    valid.sort(key=lambda t: (abs(t[1]) > 70, abs(t[1])))
-    mode, lat, lon = valid[0]
-    return mode, round(lat, 6), round(lon, 6)
+def _hhmmss_from_cc(raw_u32: int) -> str:
+    """Convert HHMMSSCC integer to 'HH:MM:SS' string (drop hundredths)."""
+    s = f"{raw_u32:08d}"[-8:]  # zero-pad and keep last 8 digits
+    hh, mm, ss = s[0:2], s[2:4], s[4:6]
+    return f"{hh}:{mm}:{ss}"
 
-def _choose_alt(alt_bytes: bytes):
-    #Try little/big-endian and simple scaling; clamp absurd values.
-    alt_le = int.from_bytes(alt_bytes, "little")
-    alt_be = int.from_bytes(alt_bytes, "big")
-    alt = alt_le
-    if alt > 60000:              # >60 km? try shift/scale
-        alt = alt_le >> 8
-    if alt > 60000:
-        alt = alt_be >> 8
-    if alt > 60000:
-        alt = 0
-    return int(alt)
+def _parse_fixed_payload(raw: bytes) -> dict:
+    """
+    Parse the fixed 0x02 + 4x4B layout directly from bytes.
+    Returns normalized dict used by writers.
+    """
+    if len(raw) < 17:
+        raise ValueError(f"payload too short: {len(raw)} bytes (need 17)")
 
-def _choose_timestamp(ts_bytes: bytes, lon_for_tz: Optional[float]):
-    # Prefer plausible epoch seconds; fallback to now (UTC). Derive coarse local time from lon.
-    now = datetime.now(timezone.utc)
+    # Optional: sanity check burn byte
+    # If it's not 0x02 we'll still proceed, but note it in 'raw' field.
+    burn = raw[0]
 
-    def plausible(sec: int):
-        return 1420070400 <= sec <= int(now.timestamp()) + 7*86400  # 2015-01-01 .. now+7d
+    lat_u32 = int.from_bytes(raw[1:5],  byteorder="big", signed=False)
+    lon_u32 = int.from_bytes(raw[5:9],  byteorder="big", signed=False)
+    alt_u32 = int.from_bytes(raw[9:13], byteorder="big", signed=False)
+    tim_u32 = int.from_bytes(raw[13:17],byteorder="big", signed=False)
 
-    ts_be = int.from_bytes(ts_bytes, "big")
-    ts_le = int.from_bytes(ts_bytes, "little")
+    lat = round(lat_u32 / 1e5 - 90.0, 6)
+    lon = round(lon_u32 / 1e5 - 180.0, 6)
+    alt_m = int(alt_u32 / 100)  # integer meters per your table
+    alt_ft = round(alt_m * 3.28084, 2)
+    utc_hms = _hhmmss_from_cc(tim_u32)
 
-    if plausible(ts_be):
-        ts = ts_be
-    elif plausible(ts_le):
-        ts = ts_le
-    else:
-        ts = int(now.timestamp())
-
-    utc_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-
+    # Crude local-time offset from longitude (same approach you used before)
     try:
-        offset_hours = round((lon_for_tz or 0) / 15)
+        offset_hours = round(lon / 15)
         if offset_hours < -12 or offset_hours > 14:
             offset_hours = 0
-        local_time = utc_time.astimezone(timezone(timedelta(hours=offset_hours)))
+        utc_today = datetime.now(timezone.utc).replace(microsecond=0)
+        utc_dt = utc_today.replace(hour=int(utc_hms[0:2]),
+                                   minute=int(utc_hms[3:5]),
+                                   second=int(utc_hms[6:8]))
+        local_dt = utc_dt.astimezone(timezone(timedelta(hours=offset_hours)))
+        local_date = local_dt.strftime("%d %b %y")
+        local_time = local_dt.strftime("%H:%M:%S")
     except Exception:
-        local_time = utc_time
+        # Fallback—still provide UTC time-of-day
+        local_date = datetime.now().strftime("%d %b %y")
+        local_time = utc_hms
 
-    return utc_time, local_time
+    return {
+        "device_id": "",                 # not present in this message layout
+        "lat": lat,
+        "lon": lon,
+        "alt_m": alt_m,
+        "alt_ft": alt_ft,
+        "utc_time": utc_hms,            # HH:MM:SS from HHMMSSCC
+        "local_date": local_date,
+        "local_time": local_time,
+        "raw": f"bytes:{raw.hex()} (burn=0x{burn:02x}, fixed_layout_v1)"
+    }
 
-# =============================================================================
-# Decoders (Hex path for XML; Base64 path for JSON)
-# -----------------------------------------------------------------------------
-# _decode_from_hexstring: accept '0x...' or bare hex; parse fixed layout and
-#                         return normalized dict for writers.
-# decode_message:         accept Base64; parse same layout; return dict.
-# Layout assumed:
-#   [0:2]=hdr, [2:6]=lat(4B), [6:10]=lon(4B), [10:14]=alt(4B), [14:18]=time(4B)
-# =============================================================================
 def _decode_from_hexstring(hex_text: str):
     """
-    Accepts '0xC0...' or 'C0...' hex; returns dict for CSV/KML/GeoJSON.
-    Layout assumed: [0:2]=hdr, [2:6]=lat(4B), [6:10]=lon(4B), [10:14]=alt(4B), [14:18]=time(4B)
+    Accepts '0x...' or bare hex. Expected 34 hex chars (17 bytes):
+      '02' + 32 chars for the 4 fields.
     """
-    try:
-        cleaned = hex_text.strip()
-        if cleaned.lower().startswith("0x"):
-            cleaned = cleaned[2:]
-        raw = binascii.unhexlify(cleaned)  # validates hex
+    cleaned = (hex_text or "").strip()
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    if len(cleaned) < 34:
+        raise ValueError(f"hex payload too short: {len(cleaned)} hex chars (need 34)")
+    raw = binascii.unhexlify(cleaned[:34])  # enforce exactly one message
+    return _parse_fixed_payload(raw)
 
-        if len(raw) < 18:
-            raise ValueError(f"payload too short: {len(raw)} bytes")
-
-        header = raw[0:2]
-        lat_b  = raw[2:6]
-        lon_b  = raw[6:10]
-        alt_b  = raw[10:14]
-        ts_b   = raw[14:18]
-
-        mode, lat, lon = _choose_latlon(lat_b, lon_b)
-        alt_m = _choose_alt(alt_b)
-        utc_time, local_time = _choose_timestamp(ts_b, lon)
-
-        return {
-            "device_id": header.hex()[2:4],  # preserves your original behavior
-            "lat": lat,
-            "lon": lon,
-            "alt_m": alt_m,
-            "alt_ft": round(alt_m * 3.28084, 2),
-            "utc_time": utc_time.strftime("%H:%M:%S"),
-            "local_date": local_time.strftime("%d %b %y"),
-            "local_time": local_time.strftime("%H:%M:%S"),
-            "raw": "hex:" + cleaned + f" (mode={mode})"
-        }
-    except Exception as e:
-        raise ValueError(f"Decode error (hex): {e}")
-
-def decode_message(payload_b64):
+def decode_message(payload_b64: str):
     """
-    Base64 decoder for /message JSON. Uses the same robust logic as hex path.
+    Base64 decoder for /message JSON. The Base64 must decode to:
+      17 bytes: 0x02 + 4 fields (lat, lon, alt, time), all big-endian.
     """
-    try:
-        raw = base64.b64decode(payload_b64)
-        if len(raw) < 18:
-            raise ValueError(f"payload too short: {len(raw)} bytes")
+    raw = base64.b64decode(payload_b64 or "")
+    if len(raw) < 17:
+        raise ValueError(f"base64 payload too short: {len(raw)} bytes (need 17)")
+    # If devices batch multiple messages in one blob, only take the first 17B.
+    return _parse_fixed_payload(raw[:17])
 
-        header = raw[0:2]
-        lat_b  = raw[2:6]
-        lon_b  = raw[6:10]
-        alt_b  = raw[10:14]
-        ts_b   = raw[14:18]
-
-        mode, lat, lon = _choose_latlon(lat_b, lon_b)
-        alt_m = _choose_alt(alt_b)
-        utc_time, local_time = _choose_timestamp(ts_b, lon)
-
-        return {
-            "device_id": header.hex()[2:4],
-            "lat": lat,
-            "lon": lon,
-            "alt_m": alt_m,
-            "alt_ft": round(alt_m * 3.28084, 2),
-            "utc_time": utc_time.strftime("%H:%M:%S"),
-            "local_date": local_time.strftime("%d %b %y"),
-            "local_time": local_time.strftime("%H:%M:%S"),
-            "raw": payload_b64 + f" (mode={mode})"
-        }
-    except Exception as e:
-        raise ValueError(f"Decode error: {e}")
 
 # =============================================================================
 # Writers (CSV / KML / GeoJSON)
