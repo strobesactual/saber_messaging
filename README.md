@@ -52,3 +52,10 @@ GeoJSON:  http://kyberdyne.ddns.net:5050/data.geojson
 
 [backoffice_var_-provisioning_icd_rev-22.pdf](https://github.com/user-attachments/files/22392468/backoffice_var_-provisioning_icd_rev-22.pdf)  
 [BackOffice_Customer_ICD.pdf](https://github.com/user-attachments/files/22392467/BackOffice_Customer_ICD.pdf)  
+
+## **Updating**
+Once you update in GitHub, SSH to the Pi and do the following:  
+cd ~/globalstar_receiver  
+git pull  
+sudo systemctl restart globalstar_receiver.service  
+
