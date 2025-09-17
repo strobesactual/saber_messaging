@@ -1,6 +1,5 @@
-# 
 # Kyberdyne Tracking Server
-# 
+
 # Purpose:
 #   - Receive Globalstar messages (XML/hex or JSON/Base64)
 #   - Decode lat/lon/alt/timestamps robustly
