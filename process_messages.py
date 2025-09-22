@@ -182,7 +182,7 @@ def _parse_fixed_payload(raw: bytes) -> dict:
         "utc_time": utc_hms,
         "lat": lat, "lon": lon,
         "alt_m": alt_m, "alt_ft": alt_ft,
-        "temp_k": temp_k, "press_hp": press_hp
+        "temp_k": temp_k, "press_hp": press_hp,
         "local_date": local_date, "local_time": local_time,
         #"raw": f"bytes:{raw.hex()} (burn=0x{burn:02x}, fixed_layout_v1)"
         "raw": raw.hex()
