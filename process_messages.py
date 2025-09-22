@@ -30,7 +30,7 @@ GEOJSON_FILE = os.path.join(TRACKING_DIR, "kyberdyne_tracking.geojson")
 
 CSV_HEADER = [
     "Device ID", "UTC Time", "Local Date", "Local Time",
-    "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)", "Raw Message"
+    "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)", "Temperature (K)", "Pressure (hP)", "Raw Message"
 ]
 
 # =============================================================================
@@ -147,17 +147,21 @@ def _parse_fixed_payload(raw: bytes) -> dict:
     if len(raw) < 17:
         raise ValueError(f"payload too short for fixed layout: {len(raw)} bytes")
     burn = raw[0]
-    lat_u32 = int.from_bytes(raw[1:5],  "big", signed=False)
-    lon_u32 = int.from_bytes(raw[5:9],  "big", signed=False)
-    alt_u32 = int.from_bytes(raw[9:13], "big", signed=False)
-    tim_u32 = int.from_bytes(raw[13:17],"big", signed=False)
+    tim_u32 = int.from_bytes(raw[1:5],  "big", signed=False)
+    lat_u32 = int.from_bytes(raw[5:9],  "big", signed=False)
+    lon_u32 = int.from_bytes(raw[9:13], "big", signed=False)
+    alt_u32 = int.from_bytes(raw[13:17],"big", signed=False)
+    temp_u32 = int.from_bytes(raw[17:21],"big", signed=False)
+    press_u32 = int.from_bytes(raw[21:25], "big", signed = False)
 
+    utc_hms = _hhmmss_from_cc(tim_u32)
     lat = round(lat_u32 / 1e5 - 90.0, 6)
     lon = round(lon_u32 / 1e5 - 180.0, 6)
     alt_m = int(alt_u32 / 100)
     alt_ft = round(alt_m * 3.28084, 2)
-    utc_hms = _hhmmss_from_cc(tim_u32)
-
+    temp_k = int(temp_u32 / 100)
+    press_hp = int(temp_u32 / 100)
+    
     try:
         offset_hours = round(lon / 15)
         if offset_hours < -12 or offset_hours > 14:
@@ -175,9 +179,10 @@ def _parse_fixed_payload(raw: bytes) -> dict:
 
     return {
         "device_id": "",
+        "utc_time": utc_hms,
         "lat": lat, "lon": lon,
         "alt_m": alt_m, "alt_ft": alt_ft,
-        "utc_time": utc_hms,
+        "temp_k": temp_k, "press_hp": press_hp
         "local_date": local_date, "local_time": local_time,
         #"raw": f"bytes:{raw.hex()} (burn=0x{burn:02x}, fixed_layout_v1)"
         "raw": raw.hex()
@@ -199,27 +204,31 @@ def _decode_from_hexstring(hex_text: str):
     except binascii.Error as e:
         raise ValueError(f"invalid hex payload: {e}")
 
-    if len(raw) >= 17:
-        return _parse_fixed_payload(raw[:17])
+    if len(raw) >= 25:
+        return _parse_fixed_payload(raw[:25])
 
     return {
         "device_id": "",
         "lat": "", "lon": "",
         "alt_m": "", "alt_ft": "",
         "utc_time": "", "local_date": "", "local_time": "",
+        "temp_k": "",
+        "press_hp": "",
         # "raw": f"bytes:{raw.hex()} (len={len(raw)}B, passthrough)"
         "raw": raw.hex()
     }
 
 def decode_message(payload_b64: str):
     raw = base64.b64decode(payload_b64 or "")
-    if len(raw) >= 17:
-        return _parse_fixed_payload(raw[:17])
+    if len(raw) >= 25:
+        return _parse_fixed_payload(raw[:25])
     return {
         "device_id": "",
         "lat": "", "lon": "",
         "alt_m": "", "alt_ft": "",
         "utc_time": "", "local_date": "", "local_time": "",
+        "temp_k": "",
+        "press_hp": "",
         # "raw": f"bytes:{raw.hex()} (len={len(raw)}B, passthrough-b64)"
         "raw": raw.hex()
     }
@@ -240,6 +249,8 @@ def append_csv(data):
             data.get('lon', ''),
             data.get('alt_m', ''),
             data.get('alt_ft', ''),
+            data.get('temp_k', ''),
+            data.get('press_hp',''),
             data.get('raw', '')
         ])
 
