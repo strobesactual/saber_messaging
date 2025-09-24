@@ -6,9 +6,34 @@
 #   - Persist points to CSV, KML, and GeoJSON
 #   - Serve read-only endpoints for downstream tools and quick live views
 #
-# Runtime:
-#   - Flask app; safe under Gunicorn or standalone (dev)
-#   - Creates/repairs data files both at startup and before each write
+# Runtime Notes (operational expectations):
+#   - Designed for 24/7 ingestion behind a firewall/NAT with port-forward on TCP/5050.
+#   - Globalstar BOF will POST XML with Content-Type=text/xml and expects an XML response.
+#   - We reply with stuResponseMsg (xsi:noNamespaceSchemaLocation pointing to the official XSD).
+#   - Max BOF wait per ICD is ~15s; keep handlers fast and avoid network I/O in the hot path.
+#
+# External (public) endpoints this app exposes (replace <HOST> with your FQDN or WAN IP):
+#   - Health check     GET http://<HOST>:5050/health
+#   - Quick live view  GET http://kyberdyne.ddns.net:5050/live
+#   - CSV artifact     GET http://<HOST>:5050/data.csv
+#   - KML artifact     GET http://<HOST>:5050/data.kml
+#   - GeoJSON artifact GET http://<HOST>:5050/data.geojson
+#
+# Globalstar Back Office (BOF) interface key points you MUST honor:
+#   - HTTP 1.1 POSTs arrive with Accept: text/xml and Content-Type: text/xml (NOT application/xml).
+#   - You must return HTTP/200 with a well-formed stuResponseMsg/prvResponseMsg XML body.
+#   - BOF may include both <stuMessage> and <ackMessage> in a batch; we ignore ackMessage.
+#   - Known BOF egress IPs to allowlist at the gateway: 3.228.87.237, 34.231.245.76, 3.135.136.171, 3.133.245.206
+#   - XSDs referenced in responses:
+#       http://cody.glpconnect.com/XSD/StuResponse_Rev1_0.xsd
+#
+# Notes on output formats consumed downstream:
+#   - CSV headers fixed; append-only.
+#   - KML 2.2 (OGC) with one Placemark per point; coords order lon,lat,alt (meters).
+#   - GeoJSON RFC 7946 FeatureCollection; geometry Point [lon, lat, alt_m]; properties carry meta.
+#   - Coordinates preferred precision: DD.DDDDDD (6 decimal places).
+#
+# ------------------------------------------------------------------------------
 
 from flask import Flask, request, jsonify, Response, send_file
 import base64
@@ -19,10 +44,25 @@ import json
 from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
 import pandas as pd
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 app = Flask(__name__)
 
+try:
+    from timezonefinder import TimezoneFinder
+    _tzf = TimezoneFinder()
+except Exception:
+    _tzf = None
+
 # === Paths ===
+# Artifact locations on disk; these filenames are also the public “download” endpoints:
+#   /data.csv    -> kyberdyne_tracking.csv  (append-only; human/audit friendly)
+#   /data.kml    -> kyberdyne_tracking.kml  (Google Earth / GEarth Pro quick check)
+#   /data.geojson-> kyberdyne_tracking.geojson (TAK/ATAK overlays, web map viewers)
+#
+# File growth expectations:
+#   - CSV grows unbounded; rotate externally if needed.
+#   - KML/GeoJSON append per point; we do simple in-place write—safe for low QPS.
 TRACKING_DIR = "tracking_data"
 CSV_FILE = os.path.join(TRACKING_DIR, "kyberdyne_tracking.csv")
 KML_FILE = os.path.join(TRACKING_DIR, "kyberdyne_tracking.kml")
@@ -30,11 +70,21 @@ GEOJSON_FILE = os.path.join(TRACKING_DIR, "kyberdyne_tracking.geojson")
 
 CSV_HEADER = [
     "Device ID", "UTC Time", "Local Date", "Local Time",
-    "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)", "Raw Message"
+    "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
+    "Temp (K)", "Pressure (hPa)", "Raw Message"
 ]
+
 
 # =============================================================================
 # Filesystem Setup / Self-Healing
+# -----------------------------------------------------------------------------
+# What this section guarantees:
+#   - CSV has a valid header row.
+#   - KML has a <Document> wrapper (OGC KML 2.2) even if the file is empty/corrupt.
+#   - GeoJSON is always a valid {"type":"FeatureCollection","features":[...]} per RFC 7946.
+#
+# Why: Globalstar can hit us before an operator ever browses the artifacts; we must never 500
+#      when /data.* endpoints are fetched by dashboards or monitoring.
 # =============================================================================
 def _seed_csv():
     with open(CSV_FILE, mode='w', newline='') as f:
@@ -91,11 +141,22 @@ def ensure_outputs_exist():
     except FileNotFoundError:
         _seed_geojson()
 
-# seed at import
+# Seed at import time so /data.* never 404/500 on first boot
 ensure_directories()
 
 # =============================================================================
 # Read-only Data Endpoints
+# -----------------------------------------------------------------------------
+# Contract:
+#   - These routes must be cache-busted (max_age=0) so external tools always see latest.
+#   - MIME types:
+#       CSV: text/csv
+#       KML: application/vnd.google-earth.kml+xml
+#       GeoJSON: application/geo+json
+# Quick checks:
+#   curl -I http://<HOST>:5050/data.csv
+#   curl -I http://<HOST>:5050/data.kml
+#   curl -I http://<HOST>:5050/data.geojson
 # =============================================================================
 @app.route("/data.csv", methods=["GET"])
 def get_csv():
@@ -123,6 +184,12 @@ def live_view():
 
 # =============================================================================
 # Envelope helpers (namespace-agnostic)
+# -----------------------------------------------------------------------------
+# Why needed:
+#   - BOF can send XML with namespaces; these helpers select by localname so we
+#     don’t break if the xmlns prefix changes or is omitted.
+# Caveats:
+#   - We treat missing elements as empty strings and continue (ingestion should be robust).
 # =============================================================================
 def _first_by_localname(parent: ET.Element, name: str):
     lname = name.lower()
@@ -138,57 +205,89 @@ def _text_by_localname(parent: ET.Element, name: str, default: str = "") -> str:
 
 # =============================================================================
 # Payload Decoding (Kyberdyne fixed layout when length >= 17 bytes)
+# -----------------------------------------------------------------------------
+# Fixed layout mapping (big-endian; 25 bytes total):
+#      [0]      burn/version (u8)
+#      [1:5]    time_u32  (HHMMSS00) -> HH:MM:SS
+#      [5:9]    lat_u32   -> (raw/1e5) - 90.0         -> DD.DDDDDD
+#      [9:13]   lon_u32   -> (raw/1e5) - 180.0        -> DD.DDDDDD
+#      [13:17]  alt_u32   -> meters = raw/100
+#      [17:21]  temp_u32  -> Kelvin = raw/100
+#      [21:25]  pres_u32  -> hPa    = raw/100
+#
+# Time handling:
+#   - If the payload includes HHMMSS, we compute local time using a crude TZ from lon/15.
+#   - If payload lacks time, we fall back to envelope unixTime (GPS epoch) minus 18s to UTC.
+#
+# Output precision:
+#   - lat/lon: 6 decimals; alt_m int; alt_ft rounded(2).
 # =============================================================================
 def _hhmmss_from_cc(raw_u32: int) -> str:
     s = f"{raw_u32:08d}"[-8:]
     return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
 
 def _parse_fixed_payload(raw: bytes) -> dict:
-    if len(raw) < 17:
-        raise ValueError(f"payload too short for fixed layout: {len(raw)} bytes")
-    burn = raw[0]
-    lat_u32 = int.from_bytes(raw[1:5],  "big", signed=False)
-    lon_u32 = int.from_bytes(raw[5:9],  "big", signed=False)
-    alt_u32 = int.from_bytes(raw[9:13], "big", signed=False)
-    tim_u32 = int.from_bytes(raw[13:17],"big", signed=False)
+    if len(raw) < 25:
+        raise ValueError(f"payload too short for fixed layout v2: {len(raw)} bytes")
 
-    lat = round(lat_u32 / 1e5 - 90.0, 6)
-    lon = round(lon_u32 / 1e5 - 180.0, 6)
-    alt_m = int(alt_u32 / 100)
+    burn      = raw[0]
+    time_u32  = int.from_bytes(raw[1:5],   "big", signed=False)
+    lat_u32   = int.from_bytes(raw[5:9],   "big", signed=False)
+    lon_u32   = int.from_bytes(raw[9:13],  "big", signed=False)
+    alt_u32   = int.from_bytes(raw[13:17], "big", signed=False)
+    temp_u32  = int.from_bytes(raw[17:21], "big", signed=False)
+    pres_u32  = int.from_bytes(raw[21:25], "big", signed=False)
+
+    lat    = round(lat_u32 / 1e5 - 90.0, 6)
+    lon    = round(lon_u32 / 1e5 - 180.0, 6)
+    alt_m  = round(alt_u32 / 100.0, 1)          # <-- keep the .1 precision (3.8 m)
     alt_ft = round(alt_m * 3.28084, 2)
-    utc_hms = _hhmmss_from_cc(tim_u32)
+    temp_k = round(temp_u32 / 100.0, 2)
+    pressure_hpa = round(pres_u32 / 100.0, 2)
 
-    try:
-        offset_hours = round(lon / 15)
-        if offset_hours < -12 or offset_hours > 14:
-            offset_hours = 0
-        utc_today = datetime.now(timezone.utc).replace(microsecond=0)
-        utc_dt = utc_today.replace(hour=int(utc_hms[0:2]),
-                                   minute=int(utc_hms[3:5]),
-                                   second=int(utc_hms[6:8]))
-        local_dt = utc_dt.astimezone(timezone(timedelta(hours=offset_hours)))
-        local_date = local_dt.strftime("%d %b %y")
-        local_time = local_dt.strftime("%H:%M:%S")
-    except Exception:
-        local_date = datetime.now().strftime("%d %b %y")
-        local_time = utc_hms
+    utc_hms = _hhmmss_from_cc(time_u32)
+
+    # Build a UTC datetime for "today" with that HH:MM:SS
+    utc_today = datetime.now(timezone.utc).replace(microsecond=0)
+    utc_dt = utc_today.replace(hour=int(utc_hms[0:2]),
+                               minute=int(utc_hms[3:5]),
+                               second=int(utc_hms[6:8]))
+
+    # Prefer real TZ (DST-aware); fallback to lon/15 if unavailable
+    local_dt = None
+    if _tzf is not None:
+        try:
+            tzname = _tzf.timezone_at(lng=lon, lat=lat)
+            if tzname:
+                local_dt = utc_dt.astimezone(ZoneInfo(tzname))
+        except Exception:
+            local_dt = None
+
+    if local_dt is None:
+        try:
+            offset_hours = round(lon / 15)
+            # clamp
+            if offset_hours < -12 or offset_hours > 14:
+                offset_hours = 0
+            local_dt = utc_dt.astimezone(timezone(timedelta(hours=offset_hours)))
+        except Exception:
+            local_dt = utc_dt
+
+    local_date = local_dt.strftime("%d %b %y")
+    local_time = local_dt.strftime("%H:%M:%S")
 
     return {
         "device_id": "",
         "lat": lat, "lon": lon,
         "alt_m": alt_m, "alt_ft": alt_ft,
+        "temp_k": temp_k, "pressure_hpa": pressure_hpa,
         "utc_time": utc_hms,
         "local_date": local_date, "local_time": local_time,
-        #"raw": f"bytes:{raw.hex()} (burn=0x{burn:02x}, fixed_layout_v1)"
         "raw": raw.hex()
     }
 
+
 def _decode_from_hexstring(hex_text: str):
-    """
-    Accepts '0x...' or bare hex. Allows any even-length payload.
-    - If >= 17 bytes: decode fixed Kyberdyne layout from first 17 bytes.
-    - If  < 17 bytes: passthrough (raw only); time will be filled from envelope.
-    """
     cleaned = (hex_text or "").strip()
     if cleaned.lower().startswith("0x"):
         cleaned = cleaned[2:]
@@ -199,33 +298,46 @@ def _decode_from_hexstring(hex_text: str):
     except binascii.Error as e:
         raise ValueError(f"invalid hex payload: {e}")
 
-    if len(raw) >= 17:
-        return _parse_fixed_payload(raw[:17])
+    if len(raw) >= 25:
+        return _parse_fixed_payload(raw[:25])
 
+    # too short for v2 → store raw only
     return {
         "device_id": "",
         "lat": "", "lon": "",
         "alt_m": "", "alt_ft": "",
+        "temp_k": "", "pressure_hpa": "",
         "utc_time": "", "local_date": "", "local_time": "",
-        # "raw": f"bytes:{raw.hex()} (len={len(raw)}B, passthrough)"
         "raw": raw.hex()
     }
+
 
 def decode_message(payload_b64: str):
     raw = base64.b64decode(payload_b64 or "")
-    if len(raw) >= 17:
-        return _parse_fixed_payload(raw[:17])
+    if len(raw) >= 25:
+        return _parse_fixed_payload(raw[:25])
     return {
         "device_id": "",
         "lat": "", "lon": "",
         "alt_m": "", "alt_ft": "",
+        "temp_k": "", "pressure_hpa": "",
         "utc_time": "", "local_date": "", "local_time": "",
-        # "raw": f"bytes:{raw.hex()} (len={len(raw)}B, passthrough-b64)"
         "raw": raw.hex()
     }
 
+
 # =============================================================================
 # Writers
+# -----------------------------------------------------------------------------
+# Persistence contract:
+#   - append_csv: one row per point; columns fixed (see CSV_HEADER).
+#   - append_kml: injects a Placemark before </Document>; safe idempotent pattern.
+#   - append_geojson: appends Feature; preserves any prior features.
+#
+# Viewer guidance:
+#   - CSV: spreadsheets, pandas, quick grep.
+#   - KML: Google Earth (drag-drop the file), fast sanity check on path/altitude.
+#   - GeoJSON: TAK/ATAK overlays, Mapbox/Leaflet, GIS tools.
 # =============================================================================
 def append_csv(data):
     ensure_outputs_exist()
@@ -240,16 +352,25 @@ def append_csv(data):
             data.get('lon', ''),
             data.get('alt_m', ''),
             data.get('alt_ft', ''),
+            data.get('temp_k', ''),
+            data.get('pressure_hpa', ''),
             data.get('raw', '')
         ])
 
+
 def append_kml(data):
     ensure_outputs_exist()
+    desc = (
+        f"Alt: {data.get('alt_m','')}m / {data.get('alt_ft','')}ft"
+        f"\\nTemp: {data.get('temp_k','')} K"
+        f"\\nPressure: {data.get('pressure_hpa','')} hPa"
+        f"\\nUTC: {data.get('utc_time','')}"
+        f"\\nRaw: {data.get('raw','')}"
+    )
     placemark = (
         f"\n    <Placemark>\n"
         f"      <name>{data.get('device_id','')}</name>\n"
-        f"      <description>Alt: {data.get('alt_m','')}m / {data.get('alt_ft','')}ft"
-        f"\\nUTC: {data.get('utc_time','')}\\nRaw: {data.get('raw','')}</description>\n"
+        f"      <description>{desc}</description>\n"
         f"      <Point><coordinates>{data.get('lon','')},{data.get('lat','')},{data.get('alt_m','')}</coordinates></Point>\n"
         f"    </Placemark>\n"
     )
@@ -263,17 +384,23 @@ def append_kml(data):
         f.write(updated)
         f.truncate()
 
+
 def append_geojson(data):
     ensure_outputs_exist()
     feature = {
         "type": "Feature",
-        "geometry": {"type": "Point", "coordinates": [data.get('lon', ''), data.get('lat', ''), data.get('alt_m', '')]},
+        "geometry": {
+            "type": "Point",
+            "coordinates": [data.get('lon', ''), data.get('lat', ''), data.get('alt_m', '')]
+        },
         "properties": {
             "device_id": data.get('device_id', ''),
             "alt_ft": data.get('alt_ft', ''),
             "utc_time": data.get('utc_time', ''),
             "local_date": data.get('local_date', ''),
             "local_time": data.get('local_time', ''),
+            "temp_k": data.get('temp_k', ''),
+            "pressure_hpa": data.get('pressure_hpa', ''),
             "raw": data.get('raw', '')
         }
     }
@@ -287,6 +414,7 @@ def append_geojson(data):
         json.dump(content, f, indent=2)
         f.truncate()
 
+
 def _store_point(data):
     append_csv(data)
     append_kml(data)
@@ -294,12 +422,17 @@ def _store_point(data):
 
 # =============================================================================
 # Health
+# -----------------------------------------------------------------------------
+# Operational checks:
+#   - /health → “OK” for LB/monitoring.
+#   - /live → quick HTML table view of CSV (helpful to eyeball latest rows).
 # =============================================================================
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
 
 def _xml_response(correlation_id: str, state="pass", state_message="Store OK"):
+    # Per ICD, the response is text/xml with stuResponseMsg and an ISO-ish timestamp (dd/MM/yyyy HH:mm:ss GMT)
     ts = datetime.utcnow().strftime("%d/%m/%Y %H:%M:%S GMT")
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <stuResponseMsg xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -313,6 +446,15 @@ def _xml_response(correlation_id: str, state="pass", state_message="Store OK"):
 
 # =============================================================================
 # XML Ingest (POST /)
+# -----------------------------------------------------------------------------
+# Route for Globalstar BOF HTTP/HTTPS POSTs.
+# Requirements pulled from ICD:
+#   - Request:     POST /  Accept:text/xml  Content-Type:text/xml
+#   - Response:    HTTP/200 + stuResponseMsg (text/xml)
+#   - Behavior:    If no valid stuMessage elements → still return pass w/ “No stuMessage payloads found”
+#   - IP control:  Ideally restrict at gateway to BOF IPs only (3.228.87.237, 34.231.245.76, 3.135.136.171, 3.133.245.206).
+# Diagnostics:
+#   - Logs print remote_addr, CT, CL, and a 200-char preview of the body.
 # =============================================================================
 @app.route("/", methods=["GET", "POST"])
 def root():
@@ -372,7 +514,7 @@ def root():
             unix_gps = _text_by_localname(child, "unixTime")  # GPS-based epoch
             bof_msg_id = root_el.attrib.get("messageID", "")
 
-            # If payload lacked time, derive from unixTime (GPS -> UTC)
+            # If payload lacked time, derive from unixTime (GPS -> UTC; GPS is ahead of UTC by ~18s)
             if not decoded.get("utc_time"):
                 try:
                     gps_epoch = int(unix_gps)
@@ -397,8 +539,7 @@ def root():
             record = dict(decoded)
             record["device_id"] = esn or uid or decoded.get("device_id", "")
 
-            # decoded["raw"] is already bare hex from the decoder changes.
-            # If you haven't changed the decoders yet, this keeps it clean anyway:
+            # Keep raw as bare hex (strip older "bytes:" prefix if present)
             raw_val = decoded["raw"].split(" ")[0]
             if raw_val.startswith("bytes:"):
                 raw_val = raw_val[len("bytes:"):]
@@ -417,8 +558,16 @@ def root():
 
 # =============================================================================
 # JSON Ingest (POST /message)
+# -----------------------------------------------------------------------------
+# Purpose:
+#   - Test harness and alternate non-BOF clients (e.g., replay tools, lambda/webhooks).
+# Example:
+#   curl -X POST http://<HOST>:5050/message \
+#     -H 'Content-Type: application/json' \
+#     -d '{"payload":"BASE64_STRING","device_id":"0-4737469"}'
+# Guarantees:
+#   - Writes to the same CSV/KML/GeoJSON pipelines as BOF XML.
 # =============================================================================
-# Example body: {"payload": "BASE64_STRING", "device_id": "optional-esn-or-uid"}
 @app.route('/message', methods=['POST'])
 def receive_message():
     try:
@@ -447,8 +596,16 @@ def receive_message():
 
 # =============================================================================
 # Dev Entry Point (Standalone Only)
+# -----------------------------------------------------------------------------
+# Production standard:
+#   - Run under Gunicorn, bound to 0.0.0.0:5050 (systemd service recommended).
+#   - Example: ./venv/bin/gunicorn -w 1 -b 0.0.0.0:5050 process_messages:app
+# Network requirements:
+#   - Gateway must port-forward TCP/5050 from WAN to this host.
+#   - Restrict source at the gateway to the four Globalstar BOF IPs when possible.
+# Smoke tests:
+#   - curl -I http://127.0.0.1:5050/health  -> 200
+#   - curl -I http://127.0.0.1:5050/data.csv -> 200 (after first write, non-empty)
 # =============================================================================
-# In production, run under Gunicorn:
-#   ./venv/bin/gunicorn -w 1 -b 0.0.0.0:5050 process_messages:app
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5050)
