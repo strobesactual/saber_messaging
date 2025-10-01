@@ -33,9 +33,9 @@ So, with 4 pieces of data each composed of 8 characters, plus 2 characters (1 by
 
 <img width="703" height="71" alt="image" src="https://github.com/user-attachments/assets/271db5eb-4246-40e1-b091-821dcb657cdb" />
 
-Base64: AgD5YpQAw2aUAFg9awAAAXwAAHPuAAAnoQ==
--will decode to-
-Hex:	0200F9629400C3669400583D6B0000017C000073EE000027A1
+Base64: AgD5YpQAw2aUAFg9awAAAXwAAHPuAAAnoQ==  
+-will decode to-  
+Hex:	0200F9629400C3669400583D6B0000017C000073EE000027A1  
 
 Reference this table to see how the data is converted into the output:
 
