@@ -31,15 +31,15 @@ I always add one byte (2 hex characters) in front of the message, because when g
 
 So, with 4 pieces of data each composed of 8 characters, plus 2 characters (1 byte) in the front to account for global star’s bit flipping, we have a message length of 2 + 8*4, or 34. 
 
-<img width="436" height="37" alt="image" src="https://github.com/user-attachments/assets/406dc586-7dc2-4bae-a688-278c0c926fd3" />
+<img width="703" height="71" alt="image" src="https://github.com/user-attachments/assets/271db5eb-4246-40e1-b091-821dcb657cdb" />
 
-Base64: AgDDZpYAWD1kAAAINAFDipA
+Base64: AgD5YpQAw2aUAFg9awAAAXwAAHPuAAAnoQ==
 -will decode to-
-Hex:	0200c3669600583d640000083401438a90
+Hex:	0200F9629400C3669400583D6B0000017C000073EE000027A1
 
 Reference this table to see how the data is converted into the output:
 
-<img width="440" height="275" alt="image" src="https://github.com/user-attachments/assets/cb8fca0e-2854-44d2-8a7b-4a01a3f71ab5" />
+<img width="663" height="515" alt="image" src="https://github.com/user-attachments/assets/86cc0a97-bbcc-4756-9ad1-c08802d60dd6" />
 
 ## **Data Access**
 Messages can be viewed in various formats using the following links:  
