@@ -1,0 +1,13 @@
+# Web stack
+Flask==3.0.3
+gunicorn==21.2.0
+
+# Data handling / CSV-HTML rendering
+pandas==2.2.2
+numpy==2.0.2
+
+# Time zone support (fallback DB for zoneinfo on systems without tzdata)
+tzdata==2024.1
+
+# Geospatial time zone lookup (for converting UTC to local based on lat/lon)
+timezonefinder==6.5.2
