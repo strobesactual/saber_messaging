@@ -1,18 +1,17 @@
 # Kyberdyne Tracking Server
-# process_messages.py
 #
 # Purpose:
 #   - Receive Globalstar messages (XML/hex or JSON/Base64)
 #   - Decode lat/lon/alt/timestamps robustly
 #   - Persist points to CSV, KML, and GeoJSON
 #   - Serve read-only endpoints for downstream tools and quick live views
-#
+
 # Runtime Notes (operational expectations):
 #   - Designed for 24/7 ingestion behind a firewall/NAT with port-forward on TCP/5050.
 #   - Globalstar BOF will POST XML with Content-Type:text/xml and expects an XML response.
 #   - We reply with stuResponseMsg (xsi:noNamespaceSchemaLocation pointing to the official XSD).
 #   - Max BOF wait per ICD is ~15s; keep handlers fast and avoid network I/O in the hot path.
-#
+
 # External (public) endpoints this app exposes (replace <HOST> with your FQDN or WAN IP):
 #   - Health check     GET http://kyberdyne.ddns.net:5050/health
 #   - Quick live view  GET http://kyberdyne.ddns.net:5050/live
