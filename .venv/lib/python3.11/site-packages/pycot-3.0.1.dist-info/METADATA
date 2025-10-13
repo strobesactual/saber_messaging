@@ -1,0 +1,78 @@
+Metadata-Version: 2.4
+Name: PyCoT
+Version: 3.0.1
+Summary: Python Cursor On Target Object-Relational Mapper
+Home-page: https://github.com/ampledata/pycot
+Author: William Crum
+Author-email: will@wcrum.dev
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pydantic>=1.10.2
+Requires-Dist: xmltodict>=0.13.0
+Provides-Extra: mitre
+Requires-Dist: PyCoT-MITRE; extra == "mitre"
+Provides-Extra: ais
+Requires-Dist: pyais; extra == "ais"
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: summary
+
+<div align="center">
+    <img src="https://pbs.twimg.com/profile_images/1204604531415212032/S8R5zrhc_400x400.jpg" height="150px"></img>
+    <h1>PyCot</h1>
+    <subtitle>Python Cursor on Target Library</subtitle>
+</div> 
+
+# Summary
+
+PyCot is developed to assist and streamline integration with programs that utilize Cursor on Target (CoT). This tool seeks to help generate, validate, and parse XML data that is defined from either MITRE or the MIL-STD.
+
+## Why?
+
+I needed an easy way to interface with CoT messages, I could not find one available.
+
+## Usage
+
+```shell
+pipx install PyCot
+```
+
+```python
+import CoT
+import datetime
+import socket
+
+now = datetime.datetime.now(datetime.timezone.utc)
+stale = now + datetime.timedelta(minutes=2)
+
+# Generate new Cursor on Target Event
+py_cot = CoT.Event(
+    version="2.0",
+    type="a-u-G-U-U-S-R-S",
+    access="Undefined",
+    uid="Debug.Python",
+    time=now,
+    start=now,
+    stale=stale,
+    how="h-g-i-g-o",
+    qos="2-i-c",
+    point=CoT.Point(lat=90, lon=90, hae=9999999, ce=9999999, le=9999999),
+    detail={"contact": {"callsign": "Debug.Python"}},
+)
+
+# Your TAK IPv4 / Port
+TAK_IP = "x.x.x.x"
+TAK_PORT = 9000
+
+# Sending UDP -> TAK Insecure Anonymous Port
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect((TAK_IP, TAK_PORT))
+
+sock.sendall(bytes(py_cot.xml(), encoding="utf-8"))
+```

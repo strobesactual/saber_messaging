@@ -1,7 +1,23 @@
 # saber_messaging
-Python script to receive, parse, store, and promulgate SABER messages received through Globalstar  
 
-Last Update: 17 Sep 25
+Purpose:  
+   - Receive Globalstar messages (XML/hex or JSON/Base64)
+   - Decode lat/lon/alt/timestamps robustly
+   - Persist points to CSV, KML, and GeoJSON
+   - Serve read-only endpoints for downstream tools and quick live views
+
+Globalstar Back Office (BOF) interface key points you MUST honor:  
+   - HTTP 1.1 POSTs arrive with Accept: text/xml and Content-Type: text/xml (NOT application/xml).
+   - You must return HTTP/200 with a well-formed stuResponseMsg/prvResponseMsg XML body.
+   - BOF may include both <stuMessage> and <ackMessage> in a batch; we ignore ackMessage.
+   - Known BOF egress IPs to allowlist at the gateway: 3.228.87.237, 34.231.245.76, 3.135.136.171, 3.133.245.206
+   - XSDs referenced in responses: http://cody.glpconnect.com/XSD/StuResponse_Rev1_0.xsd
+
+ Notes on output formats consumed downstream:
+   - CSV headers fixed; append-only.
+   - KML 2.2 (OGC) with one Placemark per point; coords order lon,lat,alt (meters).
+   - GeoJSON RFC 7946 FeatureCollection; geometry Point [lon, lat, alt_m]; properties carry meta.
+   - Coordinates preferred precision: DD.DDDDDD (6 decimal places).
 
 ## **Architecture**
 
@@ -42,11 +58,13 @@ Reference this table to see how the data is converted into the output:
 <img width="663" height="515" alt="image" src="https://github.com/user-attachments/assets/86cc0a97-bbcc-4756-9ad1-c08802d60dd6" />
 
 ## **Data Access**
-Messages can be viewed in various formats using the following links:  
-HTML:  http://kyberdyne.ddns.net:5050/live  
-CSV:  http://kyberdyne.ddns.net:5050/data.csv   
-KML:  http://kyberdyne.ddns.net:5050/data.kml  
-GeoJSON:  http://kyberdyne.ddns.net:5050/data.geojson  
+External (public) endpoints this app exposes (replace <HOST> with your FQDN or WAN IP):  
+   - Health check     GET http://kyberdyne.ddns.net:5050/health
+   - Quick live view  GET http://kyberdyne.ddns.net:5050/live
+   - CSV artifact     GET http://kyberdyne.ddns.net:5050/data.csv
+   - KML artifact     GET http://kyberdyne.ddns.net:5050/data.kml
+   - GeoJSON artifact GET http://kyberdyne.ddns.net:5050/data.geojson
+
 
 ## **References**
 
@@ -58,4 +76,17 @@ Once you update in GitHub, SSH to the Pi and do the following:
 cd ~/globalstar_receiver  
 git pull  
 sudo systemctl restart globalstar_receiver.service  
+
+## **Modules**
+process_messages.py — Flask/Gunicorn web app: receives Globalstar posts, decodes, writes CSV/KML/GeoJSON, updates in-memory index, serves /health, /live, /data.*, /devices*. Starts CoT thread only if COT_URL is set (we’ll keep it off during fixes).
+
+persist.py — Creates/maintains artifacts under tracking_data/: kyberdyne_tracking.csv, .kml, .geojson, and device_latest.csv (latest row per device). Exposes ensure_directories(), append_csv(), append_kml(), append_geojson(), and write_latest_row().
+
+device_index.py — In-memory “latest state” per device with sanity checks; supports warm-start from CSV and APIs warm_start(), update(), get_all(), get_one().
+
+payloads.py — Decoder utilities: decode_from_hexstring() for Globalstar fixed layout, decode_b64() for test harness JSON.
+
+cot_out.py — CoT publisher (PyTAK) that reads tracking_data/device_latest.csv and pushes markers to TAK; safe to import (no crash if COT_URL unset).
+
+cot_runner.py (if present) — Simple wrapper that reads env and runs cot_out.py (not strictly needed once saber-cot.service points to cot_out.py directly).
 
