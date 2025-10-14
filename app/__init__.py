@@ -1,36 +1,33 @@
 # app/__init__.py
-from __future__ import annotations
-import logging, os
+
 from flask import Flask
+import os
+from .api import register_routes
+from .storage import device_index
+from . import record_messages
+from .process_messages import set_tracker
+from .cot import start_cot_publisher
 
-def _setup_logging():
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+_cot_started = False
 
-def create_app() -> Flask:
-    _setup_logging()
 
-    # Local imports to avoid side effects during package import
-    from .config import settings
-    from .storage import record_messages as rec
-    from .storage import device_index as tracker
-    from .api import register_routes
-    from .cot.cot_publisher import start_cot_publisher
+def _maybe_start_cot():
+    global _cot_started
+    if _cot_started:
+        return
+    cot_url = os.getenv("COT_URL", "").strip()
+    if not cot_url:
+        return
+    start_cot_publisher()
+    _cot_started = True
 
+
+def create_app():
     app = Flask(__name__)
 
-    # Ensure outputs exist & warm in-memory index
-    rec.ensure_directories()
-    try:
-        tracker.warm_start(rec.CSV_FILE)
-    except Exception as e:
-        print(f"[tracker] warm_start failed: {e}")
+    # ensure process_messages updates the in-memory index
+    set_tracker(device_index)
+    _maybe_start_cot()
 
-    register_routes(app, tracker, rec)
-
-    # Start CoT publisher thread only if env is set (safe inside function)
-    start_cot_publisher()
-
+    register_routes(app, device_index, record_messages)
     return app
-
-__all__ = ["create_app"]
