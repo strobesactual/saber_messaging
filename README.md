@@ -71,11 +71,6 @@ External (public) endpoints this app exposes (replace <HOST> with your FQDN or W
 [backoffice_var_-provisioning_icd_rev-22.pdf](https://github.com/user-attachments/files/22392468/backoffice_var_-provisioning_icd_rev-22.pdf)  
 [BackOffice_Customer_ICD.pdf](https://github.com/user-attachments/files/22392467/BackOffice_Customer_ICD.pdf)  
 
-## **Updating**
-Once you update in GitHub, SSH to the Pi and do the following:  
-cd ~/globalstar_receiver  
-git pull  
-sudo systemctl restart globalstar_receiver.service  
 
 ## **Modules**
 process_messages.py — Flask/Gunicorn web app: receives Globalstar posts, decodes, writes CSV/KML/GeoJSON, updates in-memory index, serves /health, /live, /data.*, /devices*. Starts CoT thread only if COT_URL is set (we’ll keep it off during fixes).
