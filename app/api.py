@@ -5,7 +5,8 @@ import os
 import csv
 import pandas as pd
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import uuid
 from .decoding.payload_decoder import decode_from_hexstring, decode_b64
 from .process_messages import process_incoming, set_tracker
 from .storage import device_index
@@ -15,11 +16,29 @@ from . import record_messages
 def _xml_escape(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-def _stu_resp(state: str, detail: str = "", device_id: str = "") -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    detail_xml = f"<detail>{_xml_escape(detail)}</detail>" if detail else ""
+def _fmt_delivery_ts(dt: datetime) -> str:
+    # dd/MM/yyyy hh:mm:ss GMT
+    return dt.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M:%S GMT")
+
+def _stu_resp(state: str, detail: str = "", device_id: str = "", *, correlation_id: str | None = None) -> str:
+    # ICD-compliant response with attributes and optional state message.
+    now = datetime.now(timezone.utc)
+    delivery_ts = _fmt_delivery_ts(now)
+    # messageID is optional (customer-assigned). We'll generate a UUID4 for traceability.
+    msg_id = uuid.uuid4().hex
+    attrs = [
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
+        'xsi:noNamespaceSchemaLocation="http://cody.glpconnect.com/XSD/StuResponse_Rev1_0.xsd"',
+        f' deliveryTimeStamp="{delivery_ts}"',
+        f' messageID="{msg_id}"'
+    ]
+    if correlation_id:
+        attrs.append(f' correlationID="{_xml_escape(correlation_id)}"')
+    state_message_xml = f"<stateMessage>{_xml_escape(detail)}</stateMessage>" if detail else "<stateMessage />"
     did_xml = f"<deviceId>{_xml_escape(device_id)}</deviceId>" if device_id else ""
-    return f"<stuResponseMsg><time>{ts}</time><state>{state}</state>{did_xml}{detail_xml}</stuResponseMsg>"
+    return (
+        f"<stuResponseMsg {' '.join(attrs)}><state>{state}</state>{did_xml}{state_message_xml}</stuResponseMsg>"
+    )
 
 def _pick_first(d: dict, *names):
     for n in names:
@@ -43,46 +62,82 @@ def register_routes(app: Flask, tracker, rec):
                     return ""
                 return tag.split("}", 1)[-1]
 
-            stu_nodes = [el for el in root if _strip(el.tag).lower() == "stumessage"]
+            stu_nodes = [el for el in root.iter() if _strip(el.tag).lower() == "stumessage"]
+            # Correlation comes from the stuMessages root attribute if present
+            correlation_id = ""
+            try:
+                if _strip(root.tag).lower() == "stumessages":
+                    correlation_id = (root.attrib.get("messageID") or root.attrib.get("messageid") or "").strip()
+            except Exception:
+                correlation_id = ""
+
             if not stu_nodes:
-                # No stuMessage payloads (e.g., ack batches) — acknowledge and keep alive.
-                return Response(_stu_resp("pass", "no stuMessage payload"), mimetype="text/xml")
+                # Only ackMessage or empty batch — pass with 0 processed per ICD.
+                return Response(
+                    _stu_resp("pass", "0 messages received", correlation_id=correlation_id or None),
+                    mimetype="text/xml",
+                )
 
-            target = stu_nodes[0]
+            total = len(stu_nodes)
+            ok = 0
+            errors = []
 
-            # Flatten the target stuMessage (tags + attributes) into a lowercase map
-            lower = {}
-            for el in target.iter():
-                tag_name = _strip(el.tag).lower()
-                if not tag_name:
+            def _flatten(node):
+                out = {}
+                for el in node.iter():
+                    tag_name = _strip(el.tag).lower()
+                    if not tag_name:
+                        continue
+                    text = (el.text or "").strip()
+                    if tag_name not in out or text:
+                        out[tag_name] = text
+                    for attr_name, attr_val in el.attrib.items():
+                        attr_key = _strip(attr_name).lower()
+                        out[attr_key] = (attr_val or "").strip()
+                return out
+
+            for msg in stu_nodes:
+                lower = _flatten(msg)
+                device_id = _pick_first(lower, "mobileid", "deviceid", "esn", "originator", "uid")
+                payload   = _pick_first(lower, "payload", "payloadhex", "data", "message")
+                encoding  = lower.get("encoding", "").lower() or ("hex" if "payloadhex" in lower else "")
+
+                if not device_id or not payload:
+                    errors.append("missing device_id or payload")
                     continue
-                text = (el.text or "").strip()
-                if tag_name not in lower or text:
-                    lower[tag_name] = text
-                for attr_name, attr_val in el.attrib.items():
-                    attr_key = _strip(attr_name).lower()
-                    lower[attr_key] = attr_val.strip()
 
-            # Common tag names seen from Globalstar/VAR back offices
-            device_id = _pick_first(lower, "mobileid", "deviceid", "esn", "originator", "uid")
-            payload   = _pick_first(lower, "payload", "payloadhex", "data", "message")
-            encoding  = lower.get("encoding", "").lower() or ("hex" if "payloadhex" in lower else "")
+                body = {
+                    "device_id": device_id,
+                    "payload": payload,
+                    "encoding": encoding or None,
+                }
+                # If unixTime present and looks like epoch seconds/millis, pass through for timestamping
+                utxt = lower.get("unixtime", "").strip()
+                if utxt.isdigit():
+                    try:
+                        val = int(utxt)
+                        if val > 1_000_000_000_000:  # milliseconds
+                            when = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
+                        else:
+                            when = datetime.fromtimestamp(val, tz=timezone.utc)
+                        body["envelope_time_iso"] = when.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    except Exception:
+                        pass
+                if correlation_id:
+                    body["correlation_id"] = correlation_id
 
-            if not device_id or not payload:
-                current_app.logger.warning("ingest missing device_id/payload: tags=%s", list(lower.keys()))
-                return Response(_stu_resp("fail", "missing device_id or payload"), mimetype="text/xml")
+                res = process_incoming(body)
+                if res.get("status") == "success":
+                    ok += 1
+                else:
+                    errors.append(res.get("error", "unknown"))
 
-            # Hand off to our normal pipeline
-            res = process_incoming({
-                "device_id": device_id,
-                "payload": payload,
-                "encoding": encoding or None
-            })
-
-            if res.get("status") == "success":
-                return Response(_stu_resp("pass", "ok", device_id), mimetype="text/xml")
+            if ok == total and total > 0:
+                msg = f"{ok} messages received and stored successfully"
+                return Response(_stu_resp("pass", msg, correlation_id=correlation_id or None), mimetype="text/xml")
             else:
-                return Response(_stu_resp("fail", res.get("error", "unknown")), mimetype="text/xml")
+                msg = f"processed {ok} of {total}; errors: {', '.join(errors) if errors else 'unspecified'}"
+                return Response(_stu_resp("fail", msg, correlation_id=correlation_id or None), mimetype="text/xml")
         except Exception as e:
             return Response(_stu_resp("fail", str(e)), mimetype="text/xml")
 

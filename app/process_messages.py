@@ -89,20 +89,13 @@ def _compute_status(alt_m: Optional[float]) -> str:
         return "UNKNOWN"
 
 
-def _is_questionable(lat: Any, lon: Any) -> bool:
+def _valid_latlon(lat: Any, lon: Any) -> bool:
     try:
-        if lat is None or lon is None:
-            return True
         lat = float(lat)
         lon = float(lon)
-        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            return True
-        # treat (0,0) as suspect
-        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
-            return True
-        return False
+        return (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0)
     except Exception:
-        return True
+        return False
 
 
 # -----------------------
@@ -133,6 +126,10 @@ def process_incoming(body: Dict[str, Any]) -> Dict[str, Any]:
         # Normalize observation fields
         obs: Dict[str, Any] = dict(decoded)  # copy
         obs["device_id"] = device_id
+        # Optional correlation id (for dedup of CSV on BOF retries)
+        corr = body.get("correlation_id")
+        if isinstance(corr, str) and corr.strip():
+            obs["correlation_id"] = corr.strip()
 
         # Position timestamp: prefer envelope_time_iso if present
         last_pos_iso = body.get("envelope_time_iso")
@@ -140,9 +137,8 @@ def process_incoming(body: Dict[str, Any]) -> Dict[str, Any]:
             last_pos_iso = _utcnow_iso()
         obs["last_position_utc"] = last_pos_iso
 
-        # Derived flags
+        # Derived status
         obs["status"] = _compute_status(obs.get("alt_m"))
-        obs["questionable_data"] = _is_questionable(obs.get("lat"), obs.get("lon"))
 
         # Persist all outputs (CSV, GeoJSON, KML, SQLite upsert)
         record_observation(obs)

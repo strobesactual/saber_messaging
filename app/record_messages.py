@@ -40,39 +40,51 @@ TRACKING_DIR.mkdir(parents=True, exist_ok=True)
 DDL = """
 CREATE TABLE IF NOT EXISTS device_latest (
   device_id           TEXT PRIMARY KEY,
+  callsign            TEXT,
+  status              TEXT,
   lat                 REAL,
   lon                 REAL,
   alt_m               REAL,
   alt_ft              REAL,
   temp_k              REAL,
   pressure_hpa        REAL,
-  status              TEXT,
-  questionable_data   INTEGER DEFAULT 0,
   utc_time            TEXT,
   local_date          TEXT,
   local_time          TEXT,
   raw                 TEXT,
   message_count       INTEGER DEFAULT 0,
   first_seen_utc      TEXT,
-  last_position_utc   TEXT
+  last_position_utc   TEXT,
+  sr_num              INTEGER,
+  flight_started      INTEGER DEFAULT 0,
+  balloon_type        TEXT
+);
+"""
+
+DDL_INGEST_SEEN = """
+CREATE TABLE IF NOT EXISTS ingest_seen (
+  correlation_id TEXT NOT NULL,
+  raw            TEXT NOT NULL,
+  seen_utc       TEXT NOT NULL,
+  PRIMARY KEY (correlation_id, raw)
 );
 """
 
 UPSERT = """
 INSERT INTO device_latest (
-  device_id, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, status,
-  questionable_data, utc_time, local_date, local_time, raw,
+  device_id, callsign, status, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa,
+  utc_time, local_date, local_time, raw,
   message_count, first_seen_utc, last_position_utc
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
+  callsign=excluded.callsign,
+  status=excluded.status,
   lat=excluded.lat,
   lon=excluded.lon,
   alt_m=excluded.alt_m,
   alt_ft=excluded.alt_ft,
   temp_k=excluded.temp_k,
   pressure_hpa=excluded.pressure_hpa,
-  status=excluded.status,
-  questionable_data=excluded.questionable_data,
   utc_time=excluded.utc_time,
   local_date=excluded.local_date,
   local_time=excluded.local_time,
@@ -84,10 +96,10 @@ ON CONFLICT(device_id) DO UPDATE SET
 
 SELECT_GOOD = """
 SELECT device_id, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, status,
-       questionable_data, utc_time, local_date, local_time, raw,
+       utc_time, local_date, local_time, raw,
        message_count, first_seen_utc, last_position_utc
 FROM device_latest
-WHERE lat IS NOT NULL AND lon IS NOT NULL AND questionable_data=0
+WHERE lat IS NOT NULL AND lon IS NOT NULL
 """
 
 def _utcnow_iso() -> str:
@@ -99,6 +111,26 @@ def _ensure_db() -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute(DDL)
+    con.execute(DDL_INGEST_SEEN)
+    # Migrate columns if this is an older DB
+    try:
+        cur = con.execute("PRAGMA table_info(device_latest)")
+        cols = {row[1] for row in cur.fetchall()}
+        alters = []
+        if "sr_num" not in cols:
+            alters.append("ALTER TABLE device_latest ADD COLUMN sr_num INTEGER")
+        if "callsign" not in cols:
+            alters.append("ALTER TABLE device_latest ADD COLUMN callsign TEXT")
+        if "flight_started" not in cols:
+            alters.append("ALTER TABLE device_latest ADD COLUMN flight_started INTEGER DEFAULT 0")
+        if "production" not in cols:
+            alters.append("ALTER TABLE device_latest ADD COLUMN production INTEGER DEFAULT 0")
+        for sql in alters:
+            con.execute(sql)
+        if alters:
+            con.commit()
+    except Exception:
+        pass
     return con
 
 # ----------------------------
@@ -113,6 +145,27 @@ CSV_FIELDS = [
 def _append_csv(ob: Dict[str, Any]) -> None:
     if not CSV_LOG_ENABLED:
         return
+    # De-dupe CSV on (correlation_id, raw) if both present
+    cid = str(ob.get("correlation_id") or "").strip()
+    raw_hex = str(ob.get("raw") or "").strip()
+    if cid and raw_hex:
+        con = _ensure_db()
+        try:
+            before = con.total_changes
+            con.execute(
+                "INSERT OR IGNORE INTO ingest_seen (correlation_id, raw, seen_utc) VALUES (?, ?, ?)",
+                (cid, raw_hex, _utcnow_iso()),
+            )
+            con.commit()
+            if con.total_changes == before:
+                # Already seen — skip CSV append
+                con.close()
+                return
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
     CSV_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fresh = not CSV_LOG_PATH.exists()
     with CSV_LOG_PATH.open("a", newline="") as f:
@@ -211,18 +264,6 @@ def _fallback_status(ob: Dict[str, Any]) -> str:
     except Exception:
         return "UNKNOWN"
 
-def _fallback_questionable(ob: Dict[str, Any]) -> int:
-    try:
-        lat = float(ob.get("lat"))
-        lon = float(ob.get("lon"))
-        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            return 1
-        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
-            return 1
-        return 0
-    except Exception:
-        return 1
-
 def record_observation(ob: Dict[str, Any]) -> None:
     """
     Upsert 'latest' row in SQLite, log CSV row, and refresh GeoJSON/KML.
@@ -231,10 +272,13 @@ def record_observation(ob: Dict[str, Any]) -> None:
     # 1) CSV log (append-only)
     _append_csv(ob)
 
-    # Normalize missing flags
+    # Normalize
     status = ob.get("status") or _fallback_status(ob)
-    qflag  = ob.get("questionable_data")
-    qflag  = int(qflag) if isinstance(qflag, (int, bool)) else _fallback_questionable(ob)
+    # Populate callsign from last 3 digits if not provided
+    callsign = ob.get("callsign")
+    if not callsign and ob.get("device_id"):
+        tail = str(ob["device_id"])[-3:]
+        callsign = f"SR{tail}" if tail.isdigit() else "SR00"
 
     # 2) Upsert SQLite "latest"
     con = _ensure_db()
@@ -244,14 +288,14 @@ def record_observation(ob: Dict[str, Any]) -> None:
             UPSERT,
             (
                 ob.get("device_id"),
+                callsign,
+                status,
                 ob.get("lat"),
                 ob.get("lon"),
                 ob.get("alt_m"),
                 ob.get("alt_ft"),
                 ob.get("temp_k"),
                 ob.get("pressure_hpa"),
-                status,
-                qflag,
                 ob.get("utc_time"),
                 ob.get("local_date"),
                 ob.get("local_time"),

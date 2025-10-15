@@ -73,20 +73,34 @@ External (public) endpoints this app exposes (replace <HOST> with your FQDN or W
 
 ## **Updating**
 Once you update in GitHub, SSH to the Pi and do the following:  
-cd ~/globalstar_receiver  
+cd ~/saber_tracking  
 git pull  
-sudo systemctl restart globalstar_receiver.service  
+sudo systemctl restart saber_tracking.service  
 
 ## **Modules**
-process_messages.py — Flask/Gunicorn web app: receives Globalstar posts, decodes, writes CSV/KML/GeoJSON, updates in-memory index, serves /health, /live, /data.*, /devices*. Starts CoT thread only if COT_URL is set (we’ll keep it off during fixes).
 
-persist.py — Creates/maintains artifacts under tracking_data/: kyberdyne_tracking.csv, .kml, .geojson, and device_latest.csv (latest row per device). Exposes ensure_directories(), append_csv(), append_kml(), append_geojson(), and write_latest_row().
+app/api.py — All HTTP routes. Ingests Globalstar XML at `/` (parses `<stuMessages>`, handles batches, echoes `messageID` as correlation), calls `process_incoming()` and replies with ICD‑compliant `<stuResponseMsg>`. Also serves `/live`, `/data.csv|.kml|.geojson`, and `/health`.
 
-device_index.py — In-memory “latest state” per device with sanity checks; supports warm-start from CSV and APIs warm_start(), update(), get_all(), get_one().
+app/process_messages.py — Orchestrates one inbound message. Detects payload encoding, decodes via `decoding/payload_decoder.py`, derives `status`, stamps `last_position_utc`, then persists via `record_messages.record_observation()`. Optionally updates the in‑memory device index for fast reads.
 
-payloads.py — Decoder utilities: decode_from_hexstring() for Globalstar fixed layout, decode_b64() for test harness JSON.
+app/decoding/payload_decoder.py — Decoder for the fixed 25‑byte layout. Tolerates short payloads, clamps invalid lat/lon, builds UTC/local time strings, and returns a normalized dict: lat/lon, alt, temp/pressure, raw, times.
 
-cot_out.py — CoT publisher (PyTAK) that reads tracking_data/device_latest.csv and pushes markers to TAK; safe to import (no crash if COT_URL unset).
+app/record_messages.py — Persistence layer. SQLite `device_latest` table (authoritative latest per device), plus CSV and GeoJSON/KML artifacts under `tracking_data/`. Handles schema creation/migration, a single UPSERT for each observation, and regenerates map artifacts.
 
-cot_runner.py (if present) — Simple wrapper that reads env and runs cot_out.py (not strictly needed once saber-cot.service points to cot_out.py directly).
+app/storage/device_index.py — Lightweight in‑memory index of “latest per device” that backs the `/devices*` API responses without hitting SQLite for every request.
 
+app/cot/cot_publisher.py — CoT/TAK publisher thread. Opens a TLS socket to the TAK server, queries `device_latest`, computes display status, builds the remarks block, and emits CoT XML at a fixed cadence. Marker type, (optional) group tag, UID salt, and publish interval are controlled via environment.
+
+app/config.py — Central paths and toggles (tracking directory, artifact paths, CoT defaults). Safe defaults so the app runs without extra setup.
+
+app/__init__.py — Flask app factory. Registers routes, wires the in‑memory index, and starts the CoT publisher thread if `COT_URL` is set.
+
+app/wsgi.py — Gunicorn entrypoint that exposes the Flask app object.
+
+scripts/send_cot_test.py — Simple CoT test sender for local validation.
+
+### How data flows (end‑to‑end)
+1) BOF POSTs XML to `/` → `app/api.py` parses `<stuMessages>` and calls `process_incoming()` for each `<stuMessage>`.
+2) `process_incoming()` decodes the payload, derives status/timestamps, and calls `record_observation()`.
+3) `record_observation()` upserts SQLite `device_latest`, appends CSV, and regenerates GeoJSON/KML snapshots.
+4) The CoT publisher (`app/cot/cot_publisher.py`) reads `device_latest` on a schedule, formats remarks (Status, Last report UTC, Altitude ft, Lat/Lon, Balloon type), builds the CoT event and sends to TAK.
