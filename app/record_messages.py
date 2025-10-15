@@ -1,8 +1,12 @@
+# app/record_messages.py
 # ---------------------------------------------------------------------------
-# Persists each observation:
-#   1) Upsert into SQLite table device_latest (authoritative "latest" state)
-#   2) Append a full-flight CSV log (all messages)  [toggle via CSV_LOG_ENABLED]
-#   3) Regenerate GeoJSON + KML snapshots of latest positions [toggles]
+# Responsibility:
+#   - Persist each normalized observation.
+#   - device_latest (SQLite) holds the authoritative "latest per device" row.
+#   - CSV/GeoJSON/KML artifacts are maintained under tracking_data/.
+# Data flow:
+#   - Called by process_messages.record_observation(ob).
+#   - UPSERTs device_latest, rolling up max_alt_m, then regenerates snapshots.
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
+from . import status_utils
 
 # ----------------------------
 # Config (with safe fallbacks)
@@ -45,6 +50,7 @@ CREATE TABLE IF NOT EXISTS device_latest (
   lat                 REAL,
   lon                 REAL,
   alt_m               REAL,
+  max_alt_m           REAL,
   alt_ft              REAL,
   temp_k              REAL,
   pressure_hpa        REAL,
@@ -72,16 +78,17 @@ CREATE TABLE IF NOT EXISTS ingest_seen (
 
 UPSERT = """
 INSERT INTO device_latest (
-  device_id, callsign, status, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa,
+  device_id, callsign, status, lat, lon, alt_m, max_alt_m, alt_ft, temp_k, pressure_hpa,
   utc_time, local_date, local_time, raw,
   message_count, first_seen_utc, last_position_utc
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   callsign=excluded.callsign,
   status=excluded.status,
   lat=excluded.lat,
   lon=excluded.lon,
   alt_m=excluded.alt_m,
+  max_alt_m=MAX(COALESCE(device_latest.max_alt_m,0), COALESCE(excluded.alt_m,0)),
   alt_ft=excluded.alt_ft,
   temp_k=excluded.temp_k,
   pressure_hpa=excluded.pressure_hpa,
@@ -123,8 +130,10 @@ def _ensure_db() -> sqlite3.Connection:
             alters.append("ALTER TABLE device_latest ADD COLUMN callsign TEXT")
         if "flight_started" not in cols:
             alters.append("ALTER TABLE device_latest ADD COLUMN flight_started INTEGER DEFAULT 0")
-        if "production" not in cols:
-            alters.append("ALTER TABLE device_latest ADD COLUMN production INTEGER DEFAULT 0")
+        if "balloon_type" not in cols:
+            alters.append("ALTER TABLE device_latest ADD COLUMN balloon_type TEXT")
+        if "max_alt_m" not in cols:
+            alters.append("ALTER TABLE device_latest ADD COLUMN max_alt_m REAL")
         for sql in alters:
             con.execute(sql)
         if alters:
@@ -192,7 +201,7 @@ def _append_csv(ob: Dict[str, Any]) -> None:
 # ----------------------------
 def _row_to_feature(row: Tuple) -> Dict[str, Any]:
     (device_id, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, status,
-     questionable_data, utc_time, local_date, local_time, raw,
+     utc_time, local_date, local_time, raw,
      message_count, first_seen_utc, last_position_utc) = row
 
     return {
@@ -205,7 +214,6 @@ def _row_to_feature(row: Tuple) -> Dict[str, Any]:
             "temp_k": temp_k,
             "pressure_hpa": pressure_hpa,
             "status": status,
-            "questionable_data": bool(questionable_data),
             "utc_time": utc_time,
             "local_date": local_date,
             "local_time": local_time,
@@ -284,15 +292,31 @@ def record_observation(ob: Dict[str, Any]) -> None:
     con = _ensure_db()
     try:
         first_seen = _utcnow_iso()
+        # compute visual_status & max_alt rollup within UPSERT
+        # we need current persisted flight_started to compute visual status robustly
+        cur = con.execute("SELECT flight_started, max_alt_m FROM device_latest WHERE device_id=?", (ob.get("device_id"),))
+        row = cur.fetchone()
+        flight_started = bool(row[0]) if row else False
+
+        # derive visual_status using shared util (AGL-aware if SRTM is present)
+        visual_status = status_utils.compute_visual_status(
+            lat=(ob.get("lat") if ob.get("lat") not in ("", None) else None),
+            lon=(ob.get("lon") if ob.get("lon") not in ("", None) else None),
+            alt_m=(ob.get("alt_m") if ob.get("alt_m") not in ("", None) else None),
+            last_position_utc=ob.get("last_position_utc"),
+            flight_started=flight_started,
+        )
+
         con.execute(
             UPSERT,
             (
                 ob.get("device_id"),
                 callsign,
-                status,
+                visual_status,
                 ob.get("lat"),
                 ob.get("lon"),
                 ob.get("alt_m"),
+                ob.get("alt_m"),  # seed max_alt_m with current alt_m; UPSERT does MAX()
                 ob.get("alt_ft"),
                 ob.get("temp_k"),
                 ob.get("pressure_hpa"),

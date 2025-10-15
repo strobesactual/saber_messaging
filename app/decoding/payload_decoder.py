@@ -1,4 +1,9 @@
 # app/decoding/payload_decoder.py
+# ---------------------------------------------------------------------------
+# Responsibility:
+#   - Decode fixed 25-byte payloads into normalized fields. Tolerant of short
+#     payloads and clamps out-of-range lat/lon. Computes UTC/local time strings.
+# ---------------------------------------------------------------------------
 # =============================================================================
 # Payload Decoding (Kyberdyne fixed layout v2, 25 bytes)
 # -----------------------------------------------------------------------------

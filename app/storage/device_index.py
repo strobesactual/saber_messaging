@@ -1,11 +1,13 @@
 # app/storage/device_index.py
-# In-memory index of latest known device states, warm-startable from CSV.
-# Thread-safe for potential multi-worker use.
-# Supports "sticky" fields if new data lacks position or other fields.
-# Computes status (IN_FLIGHT, ON_GROUND, STALE) based on age and altitude.
-# Provides get_all() and get_one() accessors for API use.
-# Tunables via env: STALE_MINUTES, ALT_FLIGHT_THRESHOLD, TRACKER_WARM_ROWS
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Responsibility:
+#   - In-memory index of latest device states for the /devices* APIs.
+#   - Warm-startable from CSV, preserves prior values when new data is sparse.
+# Notes:
+#   - Computes a coarse status (IN_FLIGHT/ON_GROUND/STALE) for UI lists.
+#   - CoT publisher uses DB; this module isn’t in that path.
+# Tunables: STALE_MINUTES, ALT_FLIGHT_THRESHOLD, TRACKER_WARM_ROWS
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 import os, threading, csv

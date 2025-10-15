@@ -1,5 +1,14 @@
 # app/cot/cot_publisher.py
-# CoT/TAK publisher thread using asyncio + raw XML events (no CoT lib dependency)
+# ---------------------------------------------------------------------------
+# Responsibility:
+#   - Periodically read latest device rows from SQLite and publish CoT XML
+#     to a TAK server over TLS. Marker type, group tag, interval, UID salt
+#     and dual-publish are controlled via environment.
+# Notes:
+#   - Visual status (PREFLIGHT/AIRBORNE/etc.) is computed here using AGL and
+#     last_position_utc. This logic can be moved to a shared util or persisted
+#     if you prefer it outside the publisher.
+# ---------------------------------------------------------------------------
 
 import os, ssl, asyncio, threading, logging, sqlite3
 from urllib.parse import urlparse
@@ -142,10 +151,22 @@ def _argb(color_name: str) -> int:
     }
     return cmap.get(color_name, -1)
 
+def _to_opt_float(v):
+    try:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
 def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
                    utc_time: str, local_date: str, local_time: str, display_status: str,
                    callsign: str, last_pos_iso: str,
                    balloon_type: Optional[str] = None,
+                   max_alt_m: Optional[float] = None,
                    agl_m: Optional[float] = None, ground_m: Optional[float] = None,
                    marker_type: Optional[str] = None) -> str:
     now = datetime.now(timezone.utc)
@@ -174,13 +195,15 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
         dt_last = datetime.now(timezone.utc)
     last_line = dt_last.strftime("%d %b %y %H:%M")
     alt_ft = int(round(_float_or_default(alt_m, 0.0) * 3.28084))
+    max_alt_ft = int(round(_float_or_default(max_alt_m, 0.0) * 3.28084)) if max_alt_m is not None else 0
     remarks_txt = (
         f"Status: {display_status}\n"
         f"Last report: {last_line} UTC\n"
         f"Altitude: {alt_ft} ft\n"
         f"Latitude: {lat:.4f}\n"
         f"Longitude: {lon:.4f}\n"
-        f"Balloon type: {balloon_type or ''}"
+        f"Balloon type: {balloon_type or ''}\n"
+        f"Max Altitude: {max_alt_ft} ft MSL"
     )
     remarks = escape(remarks_txt)
     color = escape(_select_color(status=display_status))
@@ -239,6 +262,8 @@ async def _publish_cot(url: str):
     has_callsign = False
     has_flight_started = False
     has_balloon_type = False
+    has_visual_status = False
+    has_max_alt = False
     with sqlite3.connect(DB_PATH) as _c:
         try:
             cols = [r[1] for r in _c.execute("PRAGMA table_info(device_latest)")]
@@ -246,11 +271,15 @@ async def _publish_cot(url: str):
             has_callsign = "callsign" in cols
             has_flight_started = "flight_started" in cols
             has_balloon_type = "balloon_type" in cols
+            has_visual_status = "status" in cols
+            has_max_alt = "max_alt_m" in cols
         except Exception:
             include_sr = False
             has_callsign = False
             has_flight_started = False
             has_balloon_type = False
+            has_visual_status = False
+            has_max_alt = False
 
     cols_select = [
         "device_id", "utc_time", "local_date", "local_time",
@@ -264,8 +293,18 @@ async def _publish_cot(url: str):
         cols_select.append("flight_started")
     if has_balloon_type:
         cols_select.append("balloon_type")
+    if has_max_alt:
+        cols_select.append("max_alt_m")
     # (balloon_type exists but not used in publisher yet)
-    query = f"SELECT {', '.join(cols_select)} FROM device_latest"
+    # Optional status filter (env):
+    #   COT_STATUS_FILTER=all (default) or not_abandoned
+    status_filter = os.getenv("COT_STATUS_FILTER", "all").strip().lower()
+    base_query = f"SELECT {', '.join(cols_select)} FROM device_latest"
+    if status_filter == "not_abandoned":
+        query = base_query + " WHERE COALESCE(status,'') != 'ABANDONED'"
+    else:
+        query = base_query
+    query += " ORDER BY device_id"
 
     while True:
         try:
@@ -281,7 +320,8 @@ async def _publish_cot(url: str):
                 sr_num = row[idx] if include_sr else None; idx += 1 if include_sr else 0
                 callsign_str = row[idx] if has_callsign else None; idx += 1 if has_callsign else 0
                 flight_started_db = row[idx] if has_flight_started else None; idx += 1 if has_flight_started else 0
-                balloon_type = row[idx] if has_balloon_type else None
+                balloon_type = row[idx] if has_balloon_type else None; idx += 1 if has_balloon_type else 0
+                max_alt_m = row[idx] if has_max_alt else None
                 if not device_id:
                     continue
 
@@ -314,7 +354,8 @@ async def _publish_cot(url: str):
                 if ground is not None:
                     agl = max(0.0, alt_m - ground)
 
-                display_status = _compute_visual_status(
+                # Prefer persisted status; fall back to compute if missing
+                display_status = str(status or "") or _compute_visual_status(
                     status_db=str(status or ""),
                     agl_m=agl,
                     last_pos_iso=str(last_pos_utc or ""),
@@ -337,6 +378,7 @@ async def _publish_cot(url: str):
                     utc_time=utc_time or "", local_date=local_date or "", local_time=local_time or "",
                     display_status=display_status, callsign=cs, last_pos_iso=str(last_pos_utc or ""),
                     balloon_type=(str(balloon_type) if balloon_type is not None else None),
+                    max_alt_m=_to_opt_float(max_alt_m),
                     agl_m=agl, ground_m=ground,
                     marker_type=MARKER_TYPE,
                 )
@@ -348,6 +390,7 @@ async def _publish_cot(url: str):
                         utc_time=utc_time or "", local_date=local_date or "", local_time=local_time or "",
                         display_status=display_status, callsign=cs, last_pos_iso=str(last_pos_utc or ""),
                         balloon_type=(str(balloon_type) if balloon_type is not None else None),
+                        max_alt_m=_to_opt_float(max_alt_m),
                         agl_m=agl, ground_m=ground,
                         marker_type=DUAL_TYPE,
                     )

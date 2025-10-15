@@ -1,4 +1,12 @@
 # app/api.py
+# ---------------------------------------------------------------------------
+# Responsibility:
+#   - All HTTP endpoints: Globalstar ingest at '/', artifacts, health/live,
+#     and JSON test harness. Parses stuMessages XML and replies with ICD
+#     compliant stuResponseMsg.
+# Data flow:
+#   - For each <stuMessage>, flattens tags and calls process_incoming().
+# ---------------------------------------------------------------------------
 from __future__ import annotations
 from flask import Flask, jsonify, Response, send_file, request, current_app
 import os

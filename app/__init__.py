@@ -1,4 +1,9 @@
 # app/__init__.py
+# ---------------------------------------------------------------------------
+# Responsibility:
+#   - Flask app factory. Wires routes, device index, and starts the CoT
+#     publisher thread if COT_URL is set in the environment.
+# ---------------------------------------------------------------------------
 
 from flask import Flask
 import os

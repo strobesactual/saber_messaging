@@ -1,13 +1,13 @@
 # app/process_messages.py
 # -----------------------------------------------------------------------------
-# Ingests a single message payload and persists a normalized observation.
-#
-# Public entry point:
-#   process_incoming(body_dict: dict) -> dict
-#
-# Optional: if the web app sets a DeviceIndex via set_tracker(idx),
-#           we'll call idx.update(observation) so /devices endpoints
-#           can stay fast without hitting SQLite every time.
+# Responsibility:
+#   - Convert one inbound message into a normalized observation.
+#   - Detect payload encoding, decode, derive status/timestamps, persist.
+# Entry point:
+#   - process_incoming(body_dict) called by app/api.py
+# Notes:
+#   - Status here is altitude-based (coarse). Visual status (AGL-based) is
+#     currently computed in the CoT publisher; can be refactored later.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
