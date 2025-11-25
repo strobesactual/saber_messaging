@@ -32,7 +32,7 @@ You cannot query the Globalstar server, rather, messages are sent from Globalsta
 Messages should be formatted thus:  
 - Method: POST  
 - URL: http://kyberdyne.ddns.net:5050/  
-- Headers: Content-Type: text/xml Accept: text/xml  
+- Headers:Content-Type: text/xmlAccept: text/xml  
 - Timeout: ≥ 15 s  
 - Expected response: HTTP 200 with an XML body like <stuResponseMsg>…<state>pass</state>…</stuResponseMsg>  
 
@@ -73,9 +73,9 @@ External (public) endpoints this app exposes (replace <HOST> with your FQDN or W
 
 ## **Updating**
 Once you update in GitHub, SSH to the Pi and do the following:  
-cd ~/saber_tracking  
+cd ~/globalstar_receiver  
 git pull  
-sudo systemctl restart saber_tracking.service  
+sudo systemctl restart globalstar_receiver.service  
 
 ## **Modules**
 
