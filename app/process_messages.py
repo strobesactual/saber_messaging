@@ -98,6 +98,28 @@ def _valid_latlon(lat: Any, lon: Any) -> bool:
         return False
 
 
+def _last_position_iso(envelope_iso: Optional[str], utc_hms: str) -> str:
+    """
+    Pick the best available timestamp for ordering messages. Prefer explicit
+    envelope_time_iso; otherwise synthesize an ISO string from the payload UTC
+    time on today's date (UTC). Fallback to now if payload time is unusable.
+    """
+    if isinstance(envelope_iso, str) and envelope_iso.strip():
+        return envelope_iso.strip()
+    if isinstance(utc_hms, str) and len(utc_hms) >= 8 and utc_hms[2] == ":" and utc_hms[5] == ":":
+        try:
+            today = datetime.now(timezone.utc).replace(
+                hour=int(utc_hms[0:2]),
+                minute=int(utc_hms[3:5]),
+                second=int(utc_hms[6:8]),
+                microsecond=0,
+            )
+            return today.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        except Exception:
+            pass
+    return _utcnow_iso()
+
+
 # -----------------------
 # Main entry point
 # -----------------------
@@ -123,6 +145,16 @@ def process_incoming(body: Dict[str, Any]) -> Dict[str, Any]:
         encoding = body.get("encoding")
         decoded = _decode_payload(payload, encoding)
 
+        # Ignore noise frames that start with a 0x00 header (seen from nearby non-balloon devices).
+        raw_hex = (decoded.get("raw") or "").strip().lower()
+        if raw_hex.startswith("00"):
+            logger.info("ignoring device=%s raw startswith 0x00 (likely non-balloon chatter)", device_id)
+            return {"status": "success", "device_id": device_id, "ignored": True}
+        # Enforce expected header: only accept payloads starting with 0x02.
+        if raw_hex and not raw_hex.startswith("02"):
+            logger.info("ignoring device=%s raw missing 0x02 header: %s", device_id, raw_hex[:8])
+            return {"status": "success", "device_id": device_id, "ignored": True}
+
         # Normalize observation fields
         obs: Dict[str, Any] = dict(decoded)  # copy
         obs["device_id"] = device_id
@@ -131,20 +163,18 @@ def process_incoming(body: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(corr, str) and corr.strip():
             obs["correlation_id"] = corr.strip()
 
-        # Position timestamp: prefer envelope_time_iso if present
-        last_pos_iso = body.get("envelope_time_iso")
-        if not isinstance(last_pos_iso, str) or not last_pos_iso.strip():
-            last_pos_iso = _utcnow_iso()
+        # Position timestamp: prefer envelope_time_iso, else synthesize from payload UTC time
+        last_pos_iso = _last_position_iso(body.get("envelope_time_iso"), decoded.get("utc_time", ""))
         obs["last_position_utc"] = last_pos_iso
 
         # Derived status
         obs["status"] = _compute_status(obs.get("alt_m"))
 
         # Persist all outputs (CSV, GeoJSON, KML, SQLite upsert)
-        record_observation(obs)
+        updated = record_observation(obs)
 
         # Optionally sync to in-memory tracker for fast reads
-        if _TRACKER is not None:
+        if _TRACKER is not None and updated:
             try:
                 if hasattr(_TRACKER, "update"):
                     _TRACKER.update(obs)

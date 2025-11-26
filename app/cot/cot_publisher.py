@@ -17,16 +17,35 @@ from xml.sax.saxutils import escape
 from pathlib import Path
 from typing import Optional, Dict
 
+try:
+    from cryptography.hazmat.primitives.serialization import (
+        pkcs12,
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+except Exception as exc:  # pragma: no cover - dependency issues surface at runtime
+    pkcs12 = None
+    _crypto_import_error = exc
+else:
+    _crypto_import_error = None
+
 log = logging.getLogger("cot")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# Resolve DB path from config if available
+# Resolve config paths if available
 try:
-    from ..config import DB_PATH as _CFG_DB_PATH
-    DB_PATH = Path(_CFG_DB_PATH)
+    from .. import config as cfg
 except Exception:
-    DB_PATH = Path("tracking_data/device_latest.db")
+    cfg = None
+
+DB_PATH = Path(getattr(cfg, "DB_PATH", Path("tracking_data/device_latest.db")))
+TLS_DIR = Path(getattr(cfg, "COT_TLS_DIR", Path("tracking_data/tls")))
+CLIENT_PKCS12 = Path(getattr(cfg, "COT_PKCS12_PATH", Path("saber_user.p12")))
+TRUSTSTORE_PKCS12 = Path(getattr(cfg, "COT_PKCS12_TRUSTSTORE", Path("truststore-root.p12")))
+PKCS12_PASSWORD = str(getattr(cfg, "COT_PKCS12_PASSWORD", "atakatak"))
+TLS_SERVER_NAME = os.getenv("COT_TLS_SERVER_NAME", str(getattr(cfg, "COT_TLS_SERVER_NAME", ""))).strip()
 
 # Optional visual config
 CALLSIGN_STATIC = os.getenv("COT_CALLSIGN_STATIC", "SR00").strip() or "SR00"
@@ -63,41 +82,142 @@ def _boolish(v: str | None) -> bool:
         return False
     return str(v).strip().lower() not in ("", "0", "false", "no", "off")
 
+_TLS_CACHE: Optional[Dict[str, Optional[str]]] = None
+
+
+def _write_secure(path: Path, data: bytes) -> str:
+    """Write TLS material to disk with restrictive perms and return the path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    return str(path)
+
+
+def _materialize_pkcs12(p12_path: Path, password: str, prefix: str, require_key: bool = False) -> Dict[str, str]:
+    """
+    Unpacks a PKCS#12 bundle to PEM files inside TLS_DIR.
+    Returns dict keys: cert, key, ca (if present).
+    """
+    if pkcs12 is None:
+        raise RuntimeError(f"cryptography is required to read PKCS#12 ({_crypto_import_error})")
+    if not p12_path.exists():
+        return {}
+
+    try:
+        raw = p12_path.read_bytes()
+        key, cert, extras = pkcs12.load_key_and_certificates(raw, password.encode() if password else None)
+    except Exception as exc:
+        raise RuntimeError(f"failed to read PKCS#12 {p12_path}: {exc}") from exc
+
+    out: Dict[str, str] = {}
+    certs = []
+    if cert is not None:
+        certs.append(cert)
+        out["cert"] = _write_secure(TLS_DIR / f"{prefix}-cert.pem", cert.public_bytes(Encoding.PEM))
+    if key is not None:
+        out["key"] = _write_secure(
+            TLS_DIR / f"{prefix}-key.pem",
+            key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()),
+        )
+    if extras:
+        certs.extend([c for c in extras if c is not None])
+    if certs:
+        out["ca"] = _write_secure(
+            TLS_DIR / f"{prefix}-ca.pem",
+            b"".join(c.public_bytes(Encoding.PEM) for c in certs),
+        )
+
+    if require_key and "key" not in out:
+        raise RuntimeError(f"PKCS#12 bundle {p12_path} is missing a private key")
+    if require_key and "cert" not in out:
+        raise RuntimeError(f"PKCS#12 bundle {p12_path} is missing a client certificate")
+    return out
+
+
+def _resolve_tls_paths() -> Dict[str, Optional[str]]:
+    """
+    Returns file paths for ca/cert/key.
+    Preference order:
+      1) Explicit PYTAK_TLS_* env paths (PEM)
+      2) PKCS#12 bundles (client + truststore) unpacked to tracking_data/tls
+      3) System trust store for CA if none provided
+    """
+    global _TLS_CACHE
+    if _TLS_CACHE is not None:
+        return _TLS_CACHE
+
+    ca = os.getenv("PYTAK_TLS_CA_CERT", "").strip() or None
+    cert = os.getenv("PYTAK_TLS_CLIENT_CERT", "").strip() or None
+    key = os.getenv("PYTAK_TLS_CLIENT_KEY", "").strip() or None
+    paths: Dict[str, Optional[str]] = {"ca": ca, "cert": cert, "key": key}
+
+    password = os.getenv("COT_PKCS12_PASSWORD", PKCS12_PASSWORD)
+    client_p12 = Path(os.getenv("COT_PKCS12_PATH", str(CLIENT_PKCS12)))
+    trust_p12 = Path(os.getenv("COT_PKCS12_TRUSTSTORE", str(TRUSTSTORE_PKCS12)))
+
+    needs_cert = not (cert and key)
+    needs_ca = not ca
+
+    if needs_cert or needs_ca:
+        if client_p12.exists():
+            try:
+                cli_paths = _materialize_pkcs12(client_p12, password, "client", require_key=needs_cert)
+                if needs_cert:
+                    paths["cert"] = paths["cert"] or cli_paths.get("cert")
+                    paths["key"] = paths["key"] or cli_paths.get("key")
+                if needs_ca and cli_paths.get("ca"):
+                    paths["ca"] = paths["ca"] or cli_paths.get("ca")
+            except Exception as exc:
+                log.error("[cot] failed to load client PKCS#12 %s: %s", client_p12, exc)
+        elif needs_cert:
+            log.warning("[cot] client PKCS#12 not found at %s", client_p12)
+
+        if needs_ca and trust_p12.exists():
+            try:
+                trust_paths = _materialize_pkcs12(trust_p12, password, "trust", require_key=False)
+                if trust_paths.get("ca"):
+                    paths["ca"] = trust_paths.get("ca")
+            except Exception as exc:
+                log.error("[cot] failed to load truststore PKCS#12 %s: %s", trust_p12, exc)
+        elif needs_ca:
+            log.warning("[cot] truststore PKCS#12 not found at %s", trust_p12)
+
+    _TLS_CACHE = paths
+    return paths
+
+
 def _build_ssl_context():
-    ca = os.getenv("PYTAK_TLS_CA_CERT", "").strip()
-    cert = os.getenv("PYTAK_TLS_CLIENT_CERT", "").strip()
-    key = os.getenv("PYTAK_TLS_CLIENT_KEY", "").strip()
+    tls_paths = _resolve_tls_paths()
+    ca = tls_paths.get("ca")
+    cert = tls_paths.get("cert")
+    key = tls_paths.get("key")
     no_host_check = _boolish(os.getenv("PYTAK_TLS_DONT_CHECK_HOSTNAME", ""))
 
-    def _exist(p):
-        try:
-            return os.path.isfile(p), (os.path.getsize(p) if os.path.isfile(p) else 0)
-        except Exception:
-            return False, 0
-
-    ca_ok, ca_sz = _exist(ca)
-    cert_ok, cert_sz = _exist(cert)
-    key_ok, key_sz = _exist(key)
-
-    log.info(
-        "[cot] TLS config: ca=%s (ok=%s sz=%s) cert=%s (ok=%s sz=%s) key=%s (ok=%s sz=%s) check_hostname=%s",
-        ca or "<unset>", ca_ok, ca_sz,
-        cert or "<unset>", cert_ok, cert_sz,
-        key or "<unset>", key_ok, key_sz,
-        not no_host_check,
-    )
-
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    if ca_ok:
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    ca_desc = "<system>"
+    if ca and os.path.isfile(ca):
         ctx.load_verify_locations(cafile=ca)
+        ca_desc = ca
     else:
         ctx.load_default_certs()
 
-    if cert_ok and key_ok:
-        ctx.load_cert_chain(certfile=cert, keyfile=key)
+    if not (cert and key):
+        raise RuntimeError(
+            "Client TLS cert/key missing. Set PYTAK_TLS_CLIENT_CERT/KEY or provide COT_PKCS12_PATH."
+        )
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
 
     ctx.check_hostname = not no_host_check
     ctx.verify_mode = ssl.CERT_REQUIRED
+    log.info(
+        "[cot] TLS config: ca=%s cert=%s key=%s check_hostname=%s",
+        ca_desc, cert, key, ctx.check_hostname,
+    )
     return ctx
 
 def _iso(dt: datetime) -> str:
@@ -251,9 +371,10 @@ async def _publish_cot(url: str):
         raise ValueError(f"COT_URL missing host/port: {url!r}")
 
     ssl_ctx = _build_ssl_context()
-    server_hostname = host if ssl_ctx.check_hostname else None
+    sni_name = os.getenv("COT_TLS_SERVER_NAME", TLS_SERVER_NAME).strip() or host
+    server_hostname = sni_name if (ssl_ctx.check_hostname or sni_name) else None
 
-    log.info("[cot] connecting to %s:%s (hostname check=%s)", host, port, ssl_ctx.check_hostname)
+    log.info("[cot] connecting to %s:%s (sni=%s hostname check=%s)", host, port, server_hostname, ssl_ctx.check_hostname)
     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=server_hostname)
     log.info("[cot] connected to %s:%s", host, port)
 
@@ -406,11 +527,12 @@ async def _publish_cot(url: str):
         await asyncio.sleep(PUBLISH_INTERVAL_SEC)
 
 async def _connect_and_publish():
-    url = os.getenv("COT_URL", "").strip()
+    url = os.getenv("COT_URL", "").strip() or (str(getattr(cfg, "COT_URL", "")).strip() if cfg else "")
     if not url:
         log.info("[cot] COT_URL not set; CoT publisher not started.")
         return
 
+    log.info("[cot] CoT publisher targeting %s", url)
     while True:
         try:
             await _publish_cot(url)

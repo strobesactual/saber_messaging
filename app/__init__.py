@@ -12,6 +12,7 @@ from .storage import device_index
 from . import record_messages
 from .process_messages import set_tracker
 from .cot import start_cot_publisher
+from . import config as cfg
 
 _cot_started = False
 
@@ -20,9 +21,14 @@ def _maybe_start_cot():
     global _cot_started
     if _cot_started:
         return
-    cot_url = os.getenv("COT_URL", "").strip()
+    if os.getenv("COT_DISABLED", "").strip():
+        return
+
+    cot_url = os.getenv("COT_URL", "").strip() or getattr(cfg, "COT_URL", "").strip()
     if not cot_url:
         return
+    # ensure downstream modules see the resolved URL
+    os.environ.setdefault("COT_URL", cot_url)
     start_cot_publisher()
     _cot_started = True
 

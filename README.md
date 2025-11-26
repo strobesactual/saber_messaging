@@ -60,7 +60,8 @@ Reference this table to see how the data is converted into the output:
 ## **Data Access**
 External (public) endpoints this app exposes (replace <HOST> with your FQDN or WAN IP):  
    - Health check     GET http://kyberdyne.ddns.net:5050/health
-   - Quick live view  GET http://kyberdyne.ddns.net:5050/live
+   - Quick live view (all messages, CSV-backed) GET http://kyberdyne.ddns.net:5050/live
+   - Latest per-device snapshot (SQLite `device_latest`) GET http://kyberdyne.ddns.net:5050/latest
    - CSV artifact     GET http://kyberdyne.ddns.net:5050/data.csv
    - KML artifact     GET http://kyberdyne.ddns.net:5050/data.kml
    - GeoJSON artifact GET http://kyberdyne.ddns.net:5050/data.geojson
@@ -98,6 +99,11 @@ app/__init__.py — Flask app factory. Registers routes, wires the in‑memory i
 app/wsgi.py — Gunicorn entrypoint that exposes the Flask app object.
 
 scripts/send_cot_test.py — Simple CoT test sender for local validation.
+
+## TAK / CoT publishing
+- Default target is `ssl://kyberdyne.ddns.net:8089` (override with `COT_URL`, disable with `COT_DISABLED=1`).
+- Client auth is expected via PKCS#12 bundles in the repo root (`saber_user.p12`, `truststore-root.p12`). They are unpacked to `tracking_data/tls` at runtime; override paths or password with `COT_PKCS12_PATH`, `COT_PKCS12_TRUSTSTORE`, and `COT_PKCS12_PASSWORD`.
+- If you already have PEM files, set `PYTAK_TLS_CLIENT_CERT`, `PYTAK_TLS_CLIENT_KEY`, and optionally `PYTAK_TLS_CA_CERT` instead of using PKCS#12.
 
 ### How data flows (end‑to‑end)
 1) BOF POSTs XML to `/` → `app/api.py` parses `<stuMessages>` and calls `process_incoming()` for each `<stuMessage>`.

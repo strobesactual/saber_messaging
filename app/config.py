@@ -24,11 +24,20 @@ KML_EXPORT_ENABLED = True       # maintain KML
 GEOJSON_EXPORT_ENABLED = True   # maintain GeoJSON
 
 # ---- CoT / TAK Publisher (mostly via environment; these are fallbacks) ----
-COT_URL = os.getenv("COT_URL", "")  # e.g. "ssl://takserver:8089"
+DEFAULT_COT_URL = "ssl://kyberdyne.ddns.net:8089"
+# Set COT_URL to "" to disable the publisher entirely.
+COT_URL = os.getenv("COT_URL", DEFAULT_COT_URL)
+COT_DISABLED = os.getenv("COT_DISABLED", "")
+# PKCS#12 material (client cert/key + truststore) to bootstrap TLS
+COT_PKCS12_PATH = os.getenv("COT_PKCS12_PATH", str(BASE_DIR / "saber_user.p12"))
+COT_PKCS12_TRUSTSTORE = os.getenv("COT_PKCS12_TRUSTSTORE", str(BASE_DIR / "truststore-root.p12"))
+COT_PKCS12_PASSWORD = os.getenv("COT_PKCS12_PASSWORD", "atakatak")
+COT_TLS_DIR = os.getenv("COT_TLS_DIR", str(TRACKING_DIR / "tls"))
 PYTAK_TLS_CA_CERT = os.getenv("PYTAK_TLS_CA_CERT", "")
 PYTAK_TLS_CLIENT_CERT = os.getenv("PYTAK_TLS_CLIENT_CERT", "")
 PYTAK_TLS_CLIENT_KEY = os.getenv("PYTAK_TLS_CLIENT_KEY", "")
 PYTAK_TLS_DONT_CHECK_HOSTNAME = os.getenv("PYTAK_TLS_DONT_CHECK_HOSTNAME", "")
+COT_TLS_SERVER_NAME = os.getenv("COT_TLS_SERVER_NAME", "takserver")
 
 # ---- Tracking behaviour ----
 # Consider a device stale after this many minutes without a fresh point.

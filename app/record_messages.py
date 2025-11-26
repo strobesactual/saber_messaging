@@ -14,11 +14,13 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 from . import status_utils
 
+logger = logging.getLogger("ingest")
 # ----------------------------
 # Config (with safe fallbacks)
 # ----------------------------
@@ -76,6 +78,15 @@ CREATE TABLE IF NOT EXISTS ingest_seen (
 );
 """
 
+DDL_INGEST_SEEN_RAW = """
+CREATE TABLE IF NOT EXISTS ingest_seen_raw (
+  device_id TEXT NOT NULL,
+  raw       TEXT NOT NULL,
+  seen_utc  TEXT NOT NULL,
+  PRIMARY KEY (device_id, raw)
+);
+"""
+
 UPSERT = """
 INSERT INTO device_latest (
   device_id, callsign, status, lat, lon, alt_m, max_alt_m, alt_ft, temp_k, pressure_hpa,
@@ -112,6 +123,18 @@ WHERE lat IS NOT NULL AND lon IS NOT NULL
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
+def _logged_now() -> str:
+    # Human-friendly stamp for CSV: DD MMM YY HH:MM:SS (UTC)
+    return datetime.now(timezone.utc).strftime("%d %b %y %H:%M:%S")
+
+def _parse_iso8601(ts: str | None):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
 def _ensure_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=10)
@@ -119,6 +142,7 @@ def _ensure_db() -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute(DDL)
     con.execute(DDL_INGEST_SEEN)
+    con.execute(DDL_INGEST_SEEN_RAW)
     # Migrate columns if this is an older DB
     try:
         cur = con.execute("PRAGMA table_info(device_latest)")
@@ -148,7 +172,7 @@ def _ensure_db() -> sqlite3.Connection:
 CSV_FIELDS = [
     "Device ID", "UTC Time", "Local Date", "Local Time",
     "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
-    "Temp (K)", "Pressure (hPa)", "Raw Message"
+    "Temp (K)", "Pressure (hPa)", "Logged", "Raw Message"
 ]
 
 def _append_csv(ob: Dict[str, Any]) -> None:
@@ -157,9 +181,12 @@ def _append_csv(ob: Dict[str, Any]) -> None:
     # De-dupe CSV on (correlation_id, raw) if both present
     cid = str(ob.get("correlation_id") or "").strip()
     raw_hex = str(ob.get("raw") or "").strip()
-    if cid and raw_hex:
-        con = _ensure_db()
-        try:
+    device_id = str(ob.get("device_id") or "").strip()
+
+    con = None
+    try:
+        if cid and raw_hex:
+            con = _ensure_db()
             before = con.total_changes
             con.execute(
                 "INSERT OR IGNORE INTO ingest_seen (correlation_id, raw, seen_utc) VALUES (?, ?, ?)",
@@ -168,13 +195,25 @@ def _append_csv(ob: Dict[str, Any]) -> None:
             con.commit()
             if con.total_changes == before:
                 # Already seen — skip CSV append
-                con.close()
                 return
-        finally:
-            try:
+        # De-dupe CSV on (device_id, raw) for retransmits without correlation_id
+        if device_id and raw_hex:
+            if con is None:
+                con = _ensure_db()
+            before = con.total_changes
+            con.execute(
+                "INSERT OR IGNORE INTO ingest_seen_raw (device_id, raw, seen_utc) VALUES (?, ?, ?)",
+                (device_id, raw_hex, _utcnow_iso()),
+            )
+            con.commit()
+            if con.total_changes == before:
+                return
+    finally:
+        try:
+            if con is not None:
                 con.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
     CSV_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fresh = not CSV_LOG_PATH.exists()
     with CSV_LOG_PATH.open("a", newline="") as f:
@@ -192,6 +231,7 @@ def _append_csv(ob: Dict[str, Any]) -> None:
             "Altitude (ft)": ob.get("alt_ft"),
             "Temp (K)": ob.get("temp_k"),
             "Pressure (hPa)": ob.get("pressure_hpa"),
+            "Logged": _logged_now(),
             "Raw Message": ob.get("raw"),
         }
         w.writerow(row)
@@ -272,13 +312,28 @@ def _fallback_status(ob: Dict[str, Any]) -> str:
     except Exception:
         return "UNKNOWN"
 
-def record_observation(ob: Dict[str, Any]) -> None:
+def record_observation(ob: Dict[str, Any]) -> bool:
     """
     Upsert 'latest' row in SQLite, log CSV row, and refresh GeoJSON/KML.
     Accepts missing 'status' or 'questionable_data' and fills sensible defaults.
+    Returns True if the SQLite/KML/GeoJSON snapshots were updated, False if the
+    observation was older/equal to the stored latest for that device.
     """
+    raw_hex = str(ob.get("raw") or "").strip().lower()
+    if not raw_hex:
+        logger.info("ignoring device=%s missing raw payload", ob.get("device_id"))
+        return False
+    if raw_hex.startswith("00"):
+        logger.info("ignoring device=%s raw startswith 0x00", ob.get("device_id"))
+        return False
+    if not raw_hex.startswith("02"):
+        logger.info("ignoring device=%s raw missing 0x02 header: %s", ob.get("device_id"), raw_hex[:8])
+        return False
+
     # 1) CSV log (append-only)
     _append_csv(ob)
+
+    new_last_seen = ob.get("last_position_utc") or _utcnow_iso()
 
     # Normalize
     status = ob.get("status") or _fallback_status(ob)
@@ -294,9 +349,19 @@ def record_observation(ob: Dict[str, Any]) -> None:
         first_seen = _utcnow_iso()
         # compute visual_status & max_alt rollup within UPSERT
         # we need current persisted flight_started to compute visual status robustly
-        cur = con.execute("SELECT flight_started, max_alt_m FROM device_latest WHERE device_id=?", (ob.get("device_id"),))
+        cur = con.execute(
+            "SELECT flight_started, max_alt_m, last_position_utc FROM device_latest WHERE device_id=?",
+            (ob.get("device_id"),),
+        )
         row = cur.fetchone()
         flight_started = bool(row[0]) if row else False
+        prior_last_seen = row[2] if row and len(row) > 2 else None
+
+        prior_dt = _parse_iso8601(prior_last_seen)
+        new_dt = _parse_iso8601(new_last_seen)
+        if prior_dt and new_dt and new_dt <= prior_dt:
+            # Older or duplicate message by timestamp — keep existing latest.
+            return False
 
         # derive visual_status using shared util (AGL-aware if SRTM is present)
         visual_status = status_utils.compute_visual_status(
@@ -325,7 +390,7 @@ def record_observation(ob: Dict[str, Any]) -> None:
                 ob.get("local_time"),
                 ob.get("raw"),
                 first_seen,
-                ob.get("last_position_utc"),
+                new_last_seen,
             ),
         )
         con.commit()
@@ -335,5 +400,7 @@ def record_observation(ob: Dict[str, Any]) -> None:
         rows = cur.fetchall()
         _write_geojson(rows)
         _write_kml(rows)
+
+        return True
     finally:
         con.close()

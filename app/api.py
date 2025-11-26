@@ -11,6 +11,7 @@ from __future__ import annotations
 from flask import Flask, jsonify, Response, send_file, request, current_app
 import os
 import csv
+import sqlite3
 import pandas as pd
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -184,6 +185,11 @@ def register_routes(app: Flask, tracker, rec):
             )
             if not csv_path or not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
                 return "<i>No data yet</i>"
+            display_cols_logged = [
+                "Device ID", "UTC Time", "Local Date", "Local Time",
+                "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
+                "Temp (K)", "Pressure (hPa)", "Logged", "Raw Message"
+            ]
             display_cols = [
                 "Device ID", "UTC Time", "Local Date", "Local Time",
                 "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
@@ -216,8 +222,14 @@ def register_routes(app: Flask, tracker, rec):
                             "Altitude (ft)": mapped.get("Altitude (ft)") or mapped.get("alt_ft", ""),
                             "Temp (K)": mapped.get("Temp (K)") or mapped.get("temp_k", ""),
                             "Pressure (hPa)": mapped.get("Pressure (hPa)") or mapped.get("pressure_hpa", ""),
+                            "Logged": mapped.get("Logged", ""),
                             "Raw Message": mapped.get("Raw Message") or mapped.get("raw", ""),
                         })
+                    elif len(row) == len(display_cols_logged):
+                        if row == display_cols_logged:
+                            continue
+                        mapped = dict(zip(display_cols_logged, row))
+                        latest_rows.append({col: mapped.get(col, "") for col in display_cols_logged})
                     elif len(row) == len(display_cols):
                         if row == display_cols:
                             continue
@@ -238,14 +250,107 @@ def register_routes(app: Flask, tracker, rec):
                             "Altitude (ft)": mapped.get("alt_ft", ""),
                             "Temp (K)": mapped.get("temp_k", ""),
                             "Pressure (hPa)": mapped.get("pressure_hpa", ""),
+                            "Logged": "",
                             "Raw Message": mapped.get("raw", ""),
                         })
             if not latest_rows:
                 return "<i>No data yet</i>"
-            df = pd.DataFrame(latest_rows, columns=display_cols)
-            return df.tail(200).to_html(classes="table table-striped", border=0)
+            df = pd.DataFrame(latest_rows, columns=display_cols_logged)
+            return df.tail(400).to_html(classes="table table-striped", border=0, index=False)
         except Exception as e:
             return f"<b>Error loading CSV:</b> {e}"
+
+    # ---------- Latest per device (SQLite) ----------
+    @app.get("/latest")
+    def latest_view():
+        try:
+            db_path = getattr(rec, "DB_PATH", None)
+            if not db_path or not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
+                return "<i>No data yet</i>"
+            con = sqlite3.connect(db_path)
+            try:
+                cur = con.execute(
+                    """
+                    SELECT device_id, callsign, status, lat, lon, alt_m, alt_ft,
+                           temp_k, pressure_hpa, utc_time, local_date, local_time,
+                           message_count, first_seen_utc, last_position_utc,
+                           max_alt_m, balloon_type
+                    FROM device_latest
+                    ORDER BY last_position_utc DESC
+                    """
+                )
+                rows = cur.fetchall()
+            finally:
+                con.close()
+            if not rows:
+                return "<i>No data yet</i>"
+            cols = [
+                "Device ID", "Callsign", "Status", "Latitude", "Longitude",
+                "Altitude (m)", "Altitude (ft)", "Temp (K)", "Pressure (hPa)",
+                "UTC Time", "Local Date", "Local Time",
+                "Message Count", "First Seen UTC", "Last Position UTC",
+                "Max Alt (m)", "Balloon Type"
+            ]
+            df = pd.DataFrame(rows, columns=cols)
+            # Logged mirrors last_position_utc for readability
+            df["Logged"] = df["Last Position UTC"]
+            # Google Maps link for quick navigation
+            def _map_link(row):
+                try:
+                    lat = float(row["Latitude"])
+                    lon = float(row["Longitude"])
+                    return f'<a href="https://www.google.com/maps?q={lat},{lon}" target="_blank">map</a>'
+                except Exception:
+                    return ""
+            df["Map"] = df.apply(_map_link, axis=1)
+            # Format timestamps for readability
+            def _fmt_ts(val: str) -> str:
+                if not isinstance(val, str) or not val.strip():
+                    return ""
+                txt = val.strip()
+                try:
+                    # handle trailing Z or +00:00
+                    txt_norm = txt.replace("Z", "+00:00") if txt.endswith("Z") else txt
+                    dt = pd.to_datetime(txt_norm, utc=True, errors="coerce")
+                    if pd.isna(dt):
+                        return txt
+                    return dt.strftime("%d %b %y %H:%M:%S")
+                except Exception:
+                    return txt
+            df["Logged"] = df["Logged"].apply(_fmt_ts)
+            df["Last Position UTC"] = df["Last Position UTC"].apply(_fmt_ts)
+            df["First Seen UTC"] = df["First Seen UTC"].apply(_fmt_ts)
+            # Clean up display: round numeric fields and drop NaNs
+            def _fmt(col, fmt):
+                if col in df:
+                    df[col] = df[col].apply(lambda v: "" if v in ("", None, float("nan")) else fmt.format(float(v)))
+            _fmt("Latitude", "{:.6f}")
+            _fmt("Longitude", "{:.6f}")
+            _fmt("Altitude (m)", "{:.1f}")
+            _fmt("Altitude (ft)", "{:.2f}")
+            _fmt("Temp (K)", "{:.2f}")
+            _fmt("Pressure (hPa)", "{:.2f}")
+            _fmt("Max Alt (m)", "{:.0f}")
+            df = df.fillna("")
+            # Reorder columns to keep Logged near time fields and Map at end
+            df = df[
+                [
+                    "Device ID", "Callsign", "Status", "Latitude", "Longitude",
+                    "Altitude (m)", "Altitude (ft)", "Temp (K)", "Pressure (hPa)",
+                    "UTC Time", "Local Date", "Local Time", "Logged",
+                    "Message Count", "First Seen UTC", "Last Position UTC",
+                    "Max Alt (m)", "Balloon Type", "Map"
+                ]
+            ]
+            style = (
+                "<style>"
+                "table { font-size: 12px; line-height: 1.2; }"
+                "th, td { padding: 2px 4px; text-align: left; }"
+                "</style>"
+            )
+            return style + df.to_html(classes="table table-striped", border=0, index=False, escape=False)
+        except Exception as e:
+            return f"<b>Error loading latest:</b> {e}"
 
     # ---------- JSON test harness still available ----------
     @app.post("/message")
@@ -307,7 +412,23 @@ def register_routes(app: Flask, tracker, rec):
 def _store_point(data: dict, tracker, rec):
     # Keep the legacy helpers for JSON test route; XML route uses process_messages()
     from .record_messages import record_observation
-    record_observation(data)
+    # If caller did not provide a timestamp, synthesize one from payload UTC time to keep ordering stable.
+    if not data.get("last_position_utc"):
+        utc_hms = data.get("utc_time") or ""
+        if isinstance(utc_hms, str) and len(utc_hms) >= 8 and utc_hms[2] == ":" and utc_hms[5] == ":":
+            try:
+                today = datetime.now(timezone.utc).replace(
+                    hour=int(utc_hms[0:2]),
+                    minute=int(utc_hms[3:5]),
+                    second=int(utc_hms[6:8]),
+                    microsecond=0,
+                )
+                data["last_position_utc"] = today.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            except Exception:
+                pass
+    updated = record_observation(data)
+    if not updated:
+        return
     try:
         tracker.update(data)
     except Exception as e:
