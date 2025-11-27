@@ -10,7 +10,7 @@
 #     if you prefer it outside the publisher.
 # ---------------------------------------------------------------------------
 
-import os, ssl, asyncio, threading, logging, sqlite3
+import os, ssl, asyncio, threading, logging, sqlite3, sys
 from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 from xml.sax.saxutils import escape
@@ -53,17 +53,28 @@ ICONSET_PATH = os.getenv("COT_ICONSET_PATH", "").strip()  # e.g., "User Icons"
 ICON_FILE = os.getenv("COT_ICON_FILE", "").strip()        # e.g., "saber.png"
 # Marker type: use simple point to allow custom colors
 MARKER_TYPE = os.getenv("COT_MARKER_TYPE", "b-m-p-s").strip() or "b-m-p-s"
-# Publish interval seconds
-PUBLISH_INTERVAL_SEC = float(os.getenv("COT_PUBLISH_INTERVAL_SEC", "60").strip() or 60)
 
 # Optional group tagging for TAK dissemination
-GROUP_NAME = os.getenv("COT_GROUP_NAME", "").strip()
-GROUP_ROLE = os.getenv("COT_GROUP_ROLE", "").strip()
+# Prefer COT_GROUP_NAME / COT_GROUP_ROLE but fall back to GROUP_NAME / GROUP_ROLE
+GROUP_NAME = os.getenv("COT_GROUP_NAME", os.getenv("GROUP_NAME", "")).strip()
+GROUP_ROLE = os.getenv("COT_GROUP_ROLE", os.getenv("GROUP_ROLE", "")).strip()
 UID_SALT = os.getenv("COT_UID_SALT", "").strip()
 
 # Optional dual-publish (e.g., also send a MIL-STD marker type for visibility)
 def _env_bool(name: str, default: str = "") -> bool:
     return str(os.getenv(name, default)).strip().lower() not in ("", "0", "false", "no", "off")
+
+def _parse_interval(val: str, default: float) -> float:
+    try:
+        v = float(str(val).strip())
+    except Exception:
+        return default
+    if v <= 0:
+        return default
+    return v
+
+# Publish interval seconds
+PUBLISH_INTERVAL_SEC = _parse_interval(os.getenv("COT_PUBLISH_INTERVAL_SEC", "60"), 60.0)
 
 DUAL_MARKER = _env_bool("COT_DUAL_MARKER", "")
 DUAL_TYPE = os.getenv("COT_DUAL_TYPE", "a-f-G-U-C").strip() or "a-f-G-U-C"
@@ -154,7 +165,33 @@ def _resolve_tls_paths() -> Dict[str, Optional[str]]:
     key = os.getenv("PYTAK_TLS_CLIENT_KEY", "").strip() or None
     paths: Dict[str, Optional[str]] = {"ca": ca, "cert": cert, "key": key}
 
+    # If CA env points to a PKCS#12 bundle, unpack it first
     password = os.getenv("COT_PKCS12_PASSWORD", PKCS12_PASSWORD)
+    if ca and ca.lower().endswith((".p12", ".pfx")):
+        p12_path = Path(ca)
+        if p12_path.exists():
+            try:
+                trust_paths = _materialize_pkcs12(p12_path, password, "caenv", require_key=False)
+                if trust_paths.get("ca"):
+                    paths["ca"] = trust_paths["ca"]
+            except Exception as exc:
+                log.error("[cot] failed to load CA PKCS#12 %s: %s", p12_path, exc)
+        else:
+            log.error("[cot] CA PKCS#12 not found at %s", p12_path)
+
+    # If cert/key env point to a PKCS#12 bundle, unpack it
+    if cert and cert.lower().endswith((".p12", ".pfx")):
+        p12_path = Path(cert)
+        if p12_path.exists():
+            try:
+                cli_paths = _materialize_pkcs12(p12_path, password, "clientenv", require_key=True)
+                paths["cert"] = cli_paths.get("cert")
+                paths["key"] = cli_paths.get("key")
+            except Exception as exc:
+                log.error("[cot] failed to load client PKCS#12 %s: %s", p12_path, exc)
+        else:
+            log.error("[cot] client PKCS#12 not found at %s", p12_path)
+
     client_p12 = Path(os.getenv("COT_PKCS12_PATH", str(CLIENT_PKCS12)))
     trust_p12 = Path(os.getenv("COT_PKCS12_TRUSTSTORE", str(TRUSTSTORE_PKCS12)))
 
@@ -335,7 +372,8 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
         extra_parts.append(f'<usericon iconsetpath="{escape(ICONSET_PATH)}" icon="{escape(ICON_FILE)}"/>')
     if GROUP_NAME:
         role_attr = f' role="{escape(GROUP_ROLE)}"' if GROUP_ROLE else ''
-        extra_parts.append(f'<__group name="{escape(GROUP_NAME)}"{role_attr}/>')
+        extra_parts.append(f'<group name="{escape(GROUP_NAME)}"{role_attr}/>')
+        log.debug("[cot] adding <group> name=%s role=%s", GROUP_NAME, GROUP_ROLE or "")
     extra = ''.join(extra_parts)
     # Pick reasonable CE/LE to avoid giant uncertainty circles on MIL-STD
     ce_val = 20 if is_milstd else 9999999
@@ -362,6 +400,7 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
     return xml
 
 async def _publish_cot(url: str):
+    log.info("[cot] starting publish coroutine for url=%s", url)
     u = urlparse(url)
     if u.scheme not in ("ssl", "tls"):
         raise ValueError(f"Unsupported COT_URL scheme {u.scheme!r}; use ssl://host:port")
@@ -374,70 +413,96 @@ async def _publish_cot(url: str):
     sni_name = os.getenv("COT_TLS_SERVER_NAME", TLS_SERVER_NAME).strip() or host
     server_hostname = sni_name if (ssl_ctx.check_hostname or sni_name) else None
 
-    log.info("[cot] connecting to %s:%s (sni=%s hostname check=%s)", host, port, server_hostname, ssl_ctx.check_hostname)
-    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=server_hostname)
-    log.info("[cot] connected to %s:%s", host, port)
+    writer = None
+    try:
+        log.info("[cot] connecting to %s:%s (sni=%s hostname check=%s)", host, port, server_hostname, ssl_ctx.check_hostname)
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=server_hostname)
+        log.info("[cot] connected to %s:%s", host, port)
 
-    # Build query; include sr_num/callsign/flight_started if present
-    include_sr = False
-    has_callsign = False
-    has_flight_started = False
-    has_balloon_type = False
-    has_visual_status = False
-    has_max_alt = False
-    with sqlite3.connect(DB_PATH) as _c:
-        try:
-            cols = [r[1] for r in _c.execute("PRAGMA table_info(device_latest)")]
-            include_sr = "sr_num" in cols
-            has_callsign = "callsign" in cols
-            has_flight_started = "flight_started" in cols
-            has_balloon_type = "balloon_type" in cols
-            has_visual_status = "status" in cols
-            has_max_alt = "max_alt_m" in cols
-        except Exception:
-            include_sr = False
-            has_callsign = False
-            has_flight_started = False
-            has_balloon_type = False
-            has_visual_status = False
-            has_max_alt = False
+        # Build query; include sr_num/callsign/flight_started if present
+        include_sr = False
+        has_callsign = False
+        has_flight_started = False
+        has_balloon_type = False
+        has_status = False
+        has_last_pos = False
+        has_max_alt = False
+        with sqlite3.connect(DB_PATH) as _c:
+            try:
+                cols = [r[1] for r in _c.execute("PRAGMA table_info(device_latest)")]
+                include_sr = "sr_num" in cols
+                has_callsign = "callsign" in cols
+                has_flight_started = "flight_started" in cols
+                has_balloon_type = "balloon_type" in cols
+                has_status = "status" in cols
+                has_last_pos = "last_position_utc" in cols
+                has_max_alt = "max_alt_m" in cols
+            except Exception:
+                include_sr = False
+                has_callsign = False
+                has_flight_started = False
+                has_balloon_type = False
+                has_status = False
+                has_last_pos = False
+                has_max_alt = False
 
-    cols_select = [
-        "device_id", "utc_time", "local_date", "local_time",
-        "lat", "lon", "alt_m", "status", "last_position_utc"
-    ]
-    if include_sr:
-        cols_select.append("sr_num")
-    if has_callsign:
-        cols_select.append("callsign")
-    if has_flight_started:
-        cols_select.append("flight_started")
-    if has_balloon_type:
-        cols_select.append("balloon_type")
-    if has_max_alt:
-        cols_select.append("max_alt_m")
-    # (balloon_type exists but not used in publisher yet)
-    # Optional status filter (env):
-    #   COT_STATUS_FILTER=all (default) or not_abandoned
-    status_filter = os.getenv("COT_STATUS_FILTER", "all").strip().lower()
-    base_query = f"SELECT {', '.join(cols_select)} FROM device_latest"
-    if status_filter == "not_abandoned":
-        query = base_query + " WHERE COALESCE(status,'') != 'ABANDONED'"
-    else:
-        query = base_query
-    query += " ORDER BY device_id"
+        cols_select = [
+            "device_id", "utc_time", "local_date", "local_time",
+            "lat", "lon", "alt_m"
+        ]
+        if has_status:
+            cols_select.append("status")
+        if has_last_pos:
+            cols_select.append("last_position_utc")
+        if include_sr:
+            cols_select.append("sr_num")
+        if has_callsign:
+            cols_select.append("callsign")
+        if has_flight_started:
+            cols_select.append("flight_started")
+        if has_balloon_type:
+            cols_select.append("balloon_type")
+        if has_max_alt:
+            cols_select.append("max_alt_m")
+        # (balloon_type exists but not used in publisher yet)
+        # Optional status filter (env):
+        #   COT_STATUS_FILTER=all (default) or not_abandoned
+        status_filter = os.getenv("COT_STATUS_FILTER", "all").strip().lower()
+        base_query = f"SELECT {', '.join(cols_select)} FROM device_latest"
+        if status_filter == "not_abandoned" and has_status:
+            query = base_query + " WHERE COALESCE(status,'') != 'ABANDONED'"
+        else:
+            query = base_query
+            if status_filter == "not_abandoned" and not has_status:
+                log.warning("[cot] COT_STATUS_FILTER not_abandoned ignored; status column missing")
 
-    while True:
-        try:
+        order_clauses = []
+        if has_last_pos:
+            order_clauses.append("last_position_utc DESC")
+        else:
+            # fall back to utc_time which always exists in the schema
+            order_clauses.append("utc_time DESC")
+        order_clauses.append("device_id")
+        query += " ORDER BY " + ", ".join(order_clauses)
+
+        while True:
             with sqlite3.connect(DB_PATH) as conn:
                 cur = conn.cursor()
                 cur.execute(query)
                 rows = cur.fetchall()
+            log.debug("[cot] fetched %d device rows", len(rows))
 
             for row in rows:
                 idx = 0
-                device_id, utc_time, local_date, local_time, lat, lon, alt_m, status, last_pos_utc = row[:9]
-                idx = 9
+                device_id = row[idx]; idx += 1
+                utc_time = row[idx]; idx += 1
+                local_date = row[idx]; idx += 1
+                local_time = row[idx]; idx += 1
+                lat = row[idx]; idx += 1
+                lon = row[idx]; idx += 1
+                alt_m = row[idx]; idx += 1
+                status = row[idx] if has_status else None; idx += 1 if has_status else 0
+                last_pos_utc = row[idx] if has_last_pos else None; idx += 1 if has_last_pos else 0
                 sr_num = row[idx] if include_sr else None; idx += 1 if include_sr else 0
                 callsign_str = row[idx] if has_callsign else None; idx += 1 if has_callsign else 0
                 flight_started_db = row[idx] if has_flight_started else None; idx += 1 if has_flight_started else 0
@@ -504,6 +569,11 @@ async def _publish_cot(url: str):
                     marker_type=MARKER_TYPE,
                 )
 
+                log.debug("[cot] CoT XML primary:\n%s", xml)
+                log.debug(
+                    "[cot] queueing primary event uid=%s status=%s lat=%.6f lon=%.6f alt=%.1f",
+                    device_id, display_status, lat, lon, alt_m
+                )
                 writer.write((xml + "\n").encode("utf-8"))
                 if DUAL_MARKER:
                     xml2 = _build_cot_xml(
@@ -515,16 +585,22 @@ async def _publish_cot(url: str):
                         agl_m=agl, ground_m=ground,
                         marker_type=DUAL_TYPE,
                     )
+                    log.debug("[cot] CoT XML dual (%s):\n%s", DUAL_TYPE, xml2)
+                    log.debug("[cot] queueing dual-marker event uid=%s type=%s", device_id, DUAL_TYPE)
                     writer.write((xml2 + "\n").encode("utf-8"))
                 await writer.drain()
                 log.info("[cot] published event uid=%s vis=%s lat=%.6f lon=%.6f alt=%.1f agl=%s",
                          device_id, display_status, lat, lon, alt_m, (f"{agl:.1f}" if agl is not None else "?"))
 
-        except Exception as e:
-            log.exception("[cot] publish loop error: %s", e)
-
-        # send updates per interval
-        await asyncio.sleep(PUBLISH_INTERVAL_SEC)
+            # send updates per interval
+            await asyncio.sleep(PUBLISH_INTERVAL_SEC)
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 async def _connect_and_publish():
     url = os.getenv("COT_URL", "").strip() or (str(getattr(cfg, "COT_URL", "")).strip() if cfg else "")
@@ -598,3 +674,17 @@ def _compute_visual_status(*, status_db: str, agl_m: Optional[float], last_pos_i
 def start_cot_publisher():
     t = threading.Thread(target=_runner, name="cot-publisher", daemon=True)
     t.start()
+
+# -----------------------------
+# CLI entry point
+# -----------------------------
+if __name__ == "__main__":
+    log.setLevel(logging.DEBUG)
+    log.debug("[cot] __main__ entry argv=%s", sys.argv)
+    log.debug("[cot] env COT_URL=%s", os.getenv("COT_URL", ""))
+    log.debug("[cot] env PYTAK_TLS_CLIENT_CERT=%s", os.getenv("PYTAK_TLS_CLIENT_CERT", ""))
+    log.debug("[cot] env PYTAK_TLS_CLIENT_KEY=%s", os.getenv("PYTAK_TLS_CLIENT_KEY", ""))
+    log.debug("[cot] env PYTAK_TLS_CA_CERT=%s", os.getenv("PYTAK_TLS_CA_CERT", ""))
+    log.debug("[cot] env COT_GROUP_NAME=%s", os.getenv("COT_GROUP_NAME", ""))
+    log.debug("[cot] env GROUP_NAME=%s", os.getenv("GROUP_NAME", ""))
+    asyncio.run(_connect_and_publish())
