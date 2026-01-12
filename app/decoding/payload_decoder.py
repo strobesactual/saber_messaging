@@ -66,9 +66,11 @@ def _parse_fixed_payload(raw: bytes) -> dict:
     lon = round(lon_u32 / 1e5 - 180.0, 6) if lon_u32 is not None else None
     if lon is not None and not (-180.0 <= lon <= 180.0):
         lon = None
-    alt_m = round(alt_u32 / 100.0, 1) if alt_u32 is not None else None
+    # Flight software encodes altitude as (alt_m + 200) * 100 to keep it positive.
+    alt_m = round((alt_u32 / 100.0) - 200.0, 1) if alt_u32 is not None else None
     alt_ft = round(alt_m * 3.28084, 2) if alt_m is not None else None
     temp_k = round(temp_u32 / 100.0, 2) if temp_u32 is not None else None
+    temp_c = round(temp_k - 273.15, 2) if temp_k is not None else None
     pressure_hpa = round(pres_u32 / 100.0, 2) if pres_u32 is not None else None
 
     utc_hms = _hhmmss_from_cc(time_u32) if time_u32 is not None else ""
@@ -112,6 +114,7 @@ def _parse_fixed_payload(raw: bytes) -> dict:
         "alt_m": alt_m if alt_m is not None else "",
         "alt_ft": alt_ft if alt_ft is not None else "",
         "temp_k": temp_k if temp_k is not None else "",
+        "temp_c": temp_c if temp_c is not None else "",
         "pressure_hpa": pressure_hpa if pressure_hpa is not None else "",
         "utc_time": utc_hms,
         "local_date": local_dt.strftime("%d %b %y") if local_dt is not None else "",

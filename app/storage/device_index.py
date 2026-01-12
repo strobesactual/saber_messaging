@@ -92,7 +92,7 @@ def warm_start(csv_path: str, max_rows: int = MAX_WARM_ROWS):
                     "lon": lon,
                     "alt_m": _safe_float(row.get("Altitude (m)")),
                     "alt_ft": _safe_float(row.get("Altitude (ft)")),
-                    "temp_k": _safe_float(row.get("Temp (K)")),
+                    "temp_c": _safe_float(row.get("Temp (C)") or row.get("Temp (K)")),
                     "pressure_hpa": _safe_float(row.get("Pressure (hPa)")),
                     "raw": row.get("Raw Message", ""),
                     "last_seen_utc": _parse_last_seen(row.get("Local Date",""), row.get("Local Time","")),
@@ -132,7 +132,7 @@ def update(record: dict):
         "lon": _safe_float(record.get("lon")),
         "alt_m": _safe_float(record.get("alt_m")),
         "alt_ft": _safe_float(record.get("alt_ft")),
-        "temp_k": _safe_float(record.get("temp_k")),
+        "temp_c": _safe_float(record.get("temp_c") or record.get("temp_k")),
         "pressure_hpa": _safe_float(record.get("pressure_hpa")),
         "raw": record.get("raw", ""),
         "last_seen_utc": now_utc,
@@ -142,7 +142,7 @@ def update(record: dict):
     carried = []
 
     # Sticky merge for non-position fields
-    for k in ("alt_m", "alt_ft", "temp_k", "pressure_hpa"):
+    for k in ("alt_m", "alt_ft", "temp_c", "pressure_hpa"):
         if new_rec.get(k, "") == "" and prior.get(k, "") != "":
             new_rec[k] = prior[k]
             carried.append(k)

@@ -188,12 +188,17 @@ def register_routes(app: Flask, tracker, rec):
             display_cols_logged = [
                 "Device ID", "UTC Time", "Local Date", "Local Time",
                 "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
+                "Temp (C)", "Pressure (hPa)", "Logged", "Raw Message"
+            ]
+            display_cols_logged_old = [
+                "Device ID", "UTC Time", "Local Date", "Local Time",
+                "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
                 "Temp (K)", "Pressure (hPa)", "Logged", "Raw Message"
             ]
             display_cols = [
                 "Device ID", "UTC Time", "Local Date", "Local Time",
                 "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
-                "Temp (K)", "Pressure (hPa)", "Raw Message"
+                "Temp (C)", "Pressure (hPa)", "Raw Message"
             ]
             legacy_cols = [
                 "ingest_time_utc", "device_id", "last_position_utc",
@@ -202,13 +207,18 @@ def register_routes(app: Flask, tracker, rec):
             ]
             latest_rows = []
             new_cols = getattr(rec, "CSV_FIELDS", []) or display_cols
+            old_new_cols = [
+                "Device ID", "UTC Time", "Local Date", "Local Time",
+                "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
+                "Temp (K)", "Pressure (hPa)", "Logged", "Raw Message"
+            ]
             with open(csv_path, newline="") as f:
                 reader = csv.reader(f)
                 for row in reader:
                     if not row:
                         continue
                     if len(row) == len(new_cols):
-                        if row == new_cols:
+                        if row == new_cols or row == old_new_cols:
                             continue
                         mapped = dict(zip(new_cols, row))
                         latest_rows.append({
@@ -220,13 +230,13 @@ def register_routes(app: Flask, tracker, rec):
                             "Longitude": mapped.get("Longitude") or mapped.get("lon", ""),
                             "Altitude (m)": mapped.get("Altitude (m)") or mapped.get("alt_m", ""),
                             "Altitude (ft)": mapped.get("Altitude (ft)") or mapped.get("alt_ft", ""),
-                            "Temp (K)": mapped.get("Temp (K)") or mapped.get("temp_k", ""),
+                            "Temp (C)": mapped.get("Temp (C)") or mapped.get("Temp (K)") or mapped.get("temp_c", "") or mapped.get("temp_k", ""),
                             "Pressure (hPa)": mapped.get("Pressure (hPa)") or mapped.get("pressure_hpa", ""),
                             "Logged": mapped.get("Logged", ""),
                             "Raw Message": mapped.get("Raw Message") or mapped.get("raw", ""),
                         })
                     elif len(row) == len(display_cols_logged):
-                        if row == display_cols_logged:
+                        if row == display_cols_logged or row == display_cols_logged_old:
                             continue
                         mapped = dict(zip(display_cols_logged, row))
                         latest_rows.append({col: mapped.get(col, "") for col in display_cols_logged})
@@ -248,7 +258,7 @@ def register_routes(app: Flask, tracker, rec):
                             "Longitude": mapped.get("lon", ""),
                             "Altitude (m)": mapped.get("alt_m", ""),
                             "Altitude (ft)": mapped.get("alt_ft", ""),
-                            "Temp (K)": mapped.get("temp_k", ""),
+                            "Temp (C)": mapped.get("temp_c", "") or mapped.get("temp_k", ""),
                             "Pressure (hPa)": mapped.get("pressure_hpa", ""),
                             "Logged": "",
                             "Raw Message": mapped.get("raw", ""),
@@ -267,12 +277,12 @@ def register_routes(app: Flask, tracker, rec):
             db_path = getattr(rec, "DB_PATH", None)
             if not db_path or not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
                 return "<i>No data yet</i>"
-            con = sqlite3.connect(db_path)
+            con = rec._ensure_db()
             try:
                 cur = con.execute(
                     """
                     SELECT device_id, callsign, status, lat, lon, alt_m, alt_ft,
-                           temp_k, pressure_hpa, utc_time, local_date, local_time,
+                           temp_c, pressure_hpa, utc_time, local_date, local_time,
                            message_count, first_seen_utc, last_position_utc,
                            max_alt_m, balloon_type
                     FROM device_latest
@@ -286,7 +296,7 @@ def register_routes(app: Flask, tracker, rec):
                 return "<i>No data yet</i>"
             cols = [
                 "Device ID", "Callsign", "Status", "Latitude", "Longitude",
-                "Altitude (m)", "Altitude (ft)", "Temp (K)", "Pressure (hPa)",
+                "Altitude (m)", "Altitude (ft)", "Temp (C)", "Pressure (hPa)",
                 "UTC Time", "Local Date", "Local Time",
                 "Message Count", "First Seen UTC", "Last Position UTC",
                 "Max Alt (m)", "Balloon Type"
@@ -328,7 +338,7 @@ def register_routes(app: Flask, tracker, rec):
             _fmt("Longitude", "{:.6f}")
             _fmt("Altitude (m)", "{:.1f}")
             _fmt("Altitude (ft)", "{:.2f}")
-            _fmt("Temp (K)", "{:.2f}")
+            _fmt("Temp (C)", "{:.2f}")
             _fmt("Pressure (hPa)", "{:.2f}")
             _fmt("Max Alt (m)", "{:.0f}")
             df = df.fillna("")
@@ -336,7 +346,7 @@ def register_routes(app: Flask, tracker, rec):
             df = df[
                 [
                     "Device ID", "Callsign", "Status", "Latitude", "Longitude",
-                    "Altitude (m)", "Altitude (ft)", "Temp (K)", "Pressure (hPa)",
+                    "Altitude (m)", "Altitude (ft)", "Temp (C)", "Pressure (hPa)",
                     "UTC Time", "Local Date", "Local Time", "Logged",
                     "Message Count", "First Seen UTC", "Last Position UTC",
                     "Max Alt (m)", "Balloon Type", "Map"

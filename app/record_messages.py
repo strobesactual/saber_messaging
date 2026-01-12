@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS device_latest (
   alt_m               REAL,
   max_alt_m           REAL,
   alt_ft              REAL,
-  temp_k              REAL,
+  temp_c              REAL,
   pressure_hpa        REAL,
   utc_time            TEXT,
   local_date          TEXT,
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS ingest_seen_raw (
 
 UPSERT = """
 INSERT INTO device_latest (
-  device_id, callsign, status, lat, lon, alt_m, max_alt_m, alt_ft, temp_k, pressure_hpa,
+  device_id, callsign, status, lat, lon, alt_m, max_alt_m, alt_ft, temp_c, pressure_hpa,
   utc_time, local_date, local_time, raw,
   message_count, first_seen_utc, last_position_utc
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
@@ -101,7 +101,7 @@ ON CONFLICT(device_id) DO UPDATE SET
   alt_m=excluded.alt_m,
   max_alt_m=MAX(COALESCE(device_latest.max_alt_m,0), COALESCE(excluded.alt_m,0)),
   alt_ft=excluded.alt_ft,
-  temp_k=excluded.temp_k,
+  temp_c=excluded.temp_c,
   pressure_hpa=excluded.pressure_hpa,
   utc_time=excluded.utc_time,
   local_date=excluded.local_date,
@@ -113,7 +113,7 @@ ON CONFLICT(device_id) DO UPDATE SET
 """
 
 SELECT_GOOD = """
-SELECT device_id, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, status,
+SELECT device_id, lat, lon, alt_m, alt_ft, temp_c, pressure_hpa, status,
        utc_time, local_date, local_time, raw,
        message_count, first_seen_utc, last_position_utc
 FROM device_latest
@@ -135,6 +135,27 @@ def _parse_iso8601(ts: str | None):
     except Exception:
         return None
 
+def _temp_c_from_ob(ob: Dict[str, Any]) -> Any:
+    """
+    Prefer an explicit temp_c; otherwise derive from temp_k (Kelvin) if present.
+    Returns "" when unavailable or unparseable to keep CSV/API consistent.
+    """
+    if ob is None:
+        return ""
+    raw_c = ob.get("temp_c")
+    try:
+        if raw_c not in ("", None):
+            return round(float(raw_c), 2)
+    except Exception:
+        pass
+    raw_k = ob.get("temp_k")
+    try:
+        if raw_k not in ("", None):
+            return round(float(raw_k) - 273.15, 2)
+    except Exception:
+        pass
+    return ""
+
 def _ensure_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=10)
@@ -148,6 +169,20 @@ def _ensure_db() -> sqlite3.Connection:
         cur = con.execute("PRAGMA table_info(device_latest)")
         cols = {row[1] for row in cur.fetchall()}
         alters = []
+        added_temp_c = False
+        if "temp_c" not in cols:
+            if "temp_k" in cols:
+                try:
+                    con.execute("ALTER TABLE device_latest RENAME COLUMN temp_k TO temp_c")
+                    added_temp_c = True
+                    cols.add("temp_c")
+                    cols.discard("temp_k")
+                except Exception:
+                    alters.append("ALTER TABLE device_latest ADD COLUMN temp_c REAL")
+                    added_temp_c = True
+            else:
+                alters.append("ALTER TABLE device_latest ADD COLUMN temp_c REAL")
+                added_temp_c = True
         if "sr_num" not in cols:
             alters.append("ALTER TABLE device_latest ADD COLUMN sr_num INTEGER")
         if "callsign" not in cols:
@@ -162,6 +197,13 @@ def _ensure_db() -> sqlite3.Connection:
             con.execute(sql)
         if alters:
             con.commit()
+        # If we just added temp_c and temp_k exists, backfill temp_c from temp_k once.
+        if added_temp_c and "temp_k" in cols:
+            try:
+                con.execute("UPDATE device_latest SET temp_c = temp_k WHERE temp_c IS NULL")
+                con.commit()
+            except Exception:
+                pass
     except Exception:
         pass
     return con
@@ -172,7 +214,7 @@ def _ensure_db() -> sqlite3.Connection:
 CSV_FIELDS = [
     "Device ID", "UTC Time", "Local Date", "Local Time",
     "Latitude", "Longitude", "Altitude (m)", "Altitude (ft)",
-    "Temp (K)", "Pressure (hPa)", "Logged", "Raw Message"
+    "Temp (C)", "Pressure (hPa)", "Logged", "Raw Message"
 ]
 
 def _append_csv(ob: Dict[str, Any]) -> None:
@@ -229,7 +271,7 @@ def _append_csv(ob: Dict[str, Any]) -> None:
             "Longitude": ob.get("lon"),
             "Altitude (m)": ob.get("alt_m"),
             "Altitude (ft)": ob.get("alt_ft"),
-            "Temp (K)": ob.get("temp_k"),
+            "Temp (C)": _temp_c_from_ob(ob),
             "Pressure (hPa)": ob.get("pressure_hpa"),
             "Logged": _logged_now(),
             "Raw Message": ob.get("raw"),
@@ -240,9 +282,11 @@ def _append_csv(ob: Dict[str, Any]) -> None:
 # GeoJSON + KML snapshots
 # ----------------------------
 def _row_to_feature(row: Tuple) -> Dict[str, Any]:
-    (device_id, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, status,
+    (device_id, lat, lon, alt_m, alt_ft, temp_c, pressure_hpa, status,
      utc_time, local_date, local_time, raw,
      message_count, first_seen_utc, last_position_utc) = row
+    temp_c_val = _temp_c_from_ob({"temp_c": temp_c})
+    temp_k_prop = round(temp_c_val + 273.15, 2) if temp_c_val not in ("", None) else None
 
     return {
         "type": "Feature",
@@ -251,7 +295,8 @@ def _row_to_feature(row: Tuple) -> Dict[str, Any]:
             "device_id": device_id,
             "alt_m": alt_m,
             "alt_ft": alt_ft,
-            "temp_k": temp_k,
+            "temp_k": temp_k_prop,
+            "temp_c": temp_c_val,
             "pressure_hpa": pressure_hpa,
             "status": status,
             "utc_time": utc_time,
@@ -283,11 +328,12 @@ def _write_kml(rows: Iterable[Tuple]) -> None:
 
     placemarks: List[str] = []
     for r in rows:
-        (device_id, lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, status,
-         questionable_data, utc_time, local_date, local_time, raw,
+        (device_id, lat, lon, alt_m, alt_ft, temp_c, pressure_hpa, status,
+         utc_time, local_date, local_time, raw,
          message_count, first_seen_utc, last_position_utc) = r
+        temp_c_val = _temp_c_from_ob({"temp_c": temp_c})
         desc = (
-            f"status={status}, alt_m={alt_m}, temp_k={temp_k}, "
+            f"status={status}, alt_m={alt_m}, temp_c={temp_c_val}, "
             f"pressure_hpa={pressure_hpa}, last_position_utc={last_position_utc}, "
             f"msg_count={message_count}"
         )
@@ -371,6 +417,7 @@ def record_observation(ob: Dict[str, Any]) -> bool:
             last_position_utc=ob.get("last_position_utc"),
             flight_started=flight_started,
         )
+        temp_c = _temp_c_from_ob(ob)
 
         con.execute(
             UPSERT,
@@ -383,7 +430,7 @@ def record_observation(ob: Dict[str, Any]) -> bool:
                 ob.get("alt_m"),
                 ob.get("alt_m"),  # seed max_alt_m with current alt_m; UPSERT does MAX()
                 ob.get("alt_ft"),
-                ob.get("temp_k"),
+                temp_c,
                 ob.get("pressure_hpa"),
                 ob.get("utc_time"),
                 ob.get("local_date"),

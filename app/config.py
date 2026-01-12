@@ -50,5 +50,5 @@ LAT_LON_DECIMALS = 6
 CSV_HEADER = [
     "device_id", "utc_time", "local_date", "local_time",
     "lat", "lon", "alt_m", "alt_ft",
-    "temp_k", "pressure_hpa", "status", "raw"
+    "temp_c", "pressure_hpa", "status", "raw"
 ]

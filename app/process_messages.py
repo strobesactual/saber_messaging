@@ -59,7 +59,7 @@ def _looks_hex(s: str) -> bool:
 def _decode_payload(payload: str, encoding: Optional[str]) -> Dict[str, Any]:
     """
     Returns a dict from payload_decoder with keys:
-      lat, lon, alt_m, alt_ft, temp_k, pressure_hpa, utc_time, local_date, local_time, raw
+      lat, lon, alt_m, alt_ft, temp_k, temp_c, pressure_hpa, utc_time, local_date, local_time, raw
     """
     if not isinstance(payload, str) or not payload.strip():
         raise ValueError("payload must be a non-empty string")
