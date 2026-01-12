@@ -326,10 +326,20 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
                    max_alt_m: Optional[float] = None,
                    agl_m: Optional[float] = None, ground_m: Optional[float] = None,
                    marker_type: Optional[str] = None) -> str:
-    now = datetime.now(timezone.utc)
-    time_s = _iso(now)
+    # Use the observation timestamp for time/start/stale so stale data ages out on TAK.
+    # Fallback to "now" if parsing fails.
+    obs_dt = datetime.now(timezone.utc)
+    for candidate in (last_pos_iso, utc_time):
+        try:
+            if candidate:
+                obs_dt = datetime.fromisoformat(candidate.replace("Z", "+00:00")).astimezone(timezone.utc)
+                break
+        except Exception:
+            continue
+    time_s = _iso(obs_dt)
     start_s = time_s
-    stale_s = _iso(now + timedelta(minutes=2))
+    stale_horizon_sec = max(int(PUBLISH_INTERVAL_SEC * 2), 120)
+    stale_s = _iso(obs_dt + timedelta(seconds=stale_horizon_sec))
 
     # sanitize
     mtype = escape(marker_type or MARKER_TYPE)
@@ -375,9 +385,9 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
         extra_parts.append(f'<group name="{escape(GROUP_NAME)}"{role_attr}/>')
         log.debug("[cot] adding <group> name=%s role=%s", GROUP_NAME, GROUP_ROLE or "")
     extra = ''.join(extra_parts)
-    # Pick reasonable CE/LE to avoid giant uncertainty circles on MIL-STD
-    ce_val = 20 if is_milstd else 9999999
-    le_val = 20 if is_milstd else 9999999
+    # Pick reasonable CE/LE to avoid giant uncertainty circles
+    ce_val = 20 if is_milstd else 50
+    le_val = 20 if is_milstd else 50
     parts = [
         f'<event version="2.0" type="{mtype}" uid="{did}" ',
         f'time="{time_s}" start="{start_s}" stale="{stale_s}" how="h-g-i-g-o">',
@@ -516,11 +526,13 @@ async def _publish_cot(url: str):
                 lon = _float_or_default(lon, 0.0)
                 alt_m = _float_or_default(alt_m, 0.0)
 
-                # Clamp to valid ranges
+                # Skip invalid fixes rather than emitting bogus (0,0) points
                 if not (-90.0 <= lat <= 90.0):
-                    lat = 0.0
+                    continue
                 if not (-180.0 <= lon <= 180.0):
-                    lon = 0.0
+                    continue
+                if not isinstance(alt_m, (int, float)):
+                    continue
                 if alt_m < 0:
                     alt_m = 0.0
 
