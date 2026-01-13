@@ -338,7 +338,8 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
             continue
     time_s = _iso(obs_dt)
     start_s = time_s
-    stale_horizon_sec = max(int(PUBLISH_INTERVAL_SEC * 2), 120)
+    # Keep markers visible for a long horizon (30 days).
+    stale_horizon_sec = 30 * 24 * 60 * 60
     stale_s = _iso(obs_dt + timedelta(seconds=stale_horizon_sec))
 
     # sanitize
