@@ -25,6 +25,7 @@ COT_URL = os.getenv("COT_URL", "ssl://192.168.30.62:8089")
 CLIENT_CERT = os.getenv("PYTAK_TLS_CLIENT_CERT", "/home/austin/tak-certs/saber_server.pem")
 CLIENT_KEY = os.getenv("PYTAK_TLS_CLIENT_KEY", "/home/austin/tak-certs/saber_server.key")
 CA_FILE = os.getenv("PYTAK_TLS_CA_CERT", "/home/austin/tak-certs/ca.pem")
+MARKER_TYPE = os.getenv("COT_MARKER_TYPE", "a-f-A").strip() or "a-f-A"
 
 
 def _build_cot(device_id: str, lat: float, lon: float, alt_m: float, ts_iso: str, callsign: str) -> str:
@@ -32,9 +33,9 @@ def _build_cot(device_id: str, lat: float, lon: float, alt_m: float, ts_iso: str
     stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 30 * 24 * 60 * 60))
     t = ts_iso or now
     return (
-        f'<event version="2.0" uid="{device_id}-fleet" type="b-m-p-s" '
+        f'<event version="2.0" uid="{device_id}-fleet" type="{MARKER_TYPE}" '
         f'time="{t}" start="{t}" stale="{stale}" how="m-g">'
-        f'<point lat="{lat:.6f}" lon="{lon:.6f}" hae="{alt_m:.1f}" ce="50" le="50"/>'
+        f'<point lat="{lat:.6f}" lon="{lon:.6f}" hae="{alt_m:.1f}" ce="0" le="0"/>'
         f'<detail><contact callsign="{callsign}"/><remarks>Fleet push</remarks></detail>'
         f'</event>'
     )

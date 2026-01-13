@@ -51,8 +51,8 @@ TLS_SERVER_NAME = os.getenv("COT_TLS_SERVER_NAME", str(getattr(cfg, "COT_TLS_SER
 CALLSIGN_STATIC = os.getenv("COT_CALLSIGN_STATIC", "SR00").strip() or "SR00"
 ICONSET_PATH = os.getenv("COT_ICONSET_PATH", "").strip()  # e.g., "User Icons"
 ICON_FILE = os.getenv("COT_ICON_FILE", "").strip()        # e.g., "saber.png"
-# Marker type: use simple point to allow custom colors
-MARKER_TYPE = os.getenv("COT_MARKER_TYPE", "b-m-p-s").strip() or "b-m-p-s"
+# Marker type: default to friendly air (balloon) MIL-STD symbol
+MARKER_TYPE = os.getenv("COT_MARKER_TYPE", "a-f-A").strip() or "a-f-A"
 
 # Optional group tagging for TAK dissemination
 # Prefer COT_GROUP_NAME / COT_GROUP_ROLE but fall back to GROUP_NAME / GROUP_ROLE
@@ -386,9 +386,9 @@ def _build_cot_xml(*, device_id: str, lat: float, lon: float, alt_m: float,
         extra_parts.append(f'<group name="{escape(GROUP_NAME)}"{role_attr}/>')
         log.debug("[cot] adding <group> name=%s role=%s", GROUP_NAME, GROUP_ROLE or "")
     extra = ''.join(extra_parts)
-    # Pick reasonable CE/LE to avoid giant uncertainty circles
-    ce_val = 20 if is_milstd else 50
-    le_val = 20 if is_milstd else 50
+    # Zero CE/LE to avoid circles; MIL-STD icon will render cleanly
+    ce_val = 0
+    le_val = 0
     parts = [
         f'<event version="2.0" type="{mtype}" uid="{did}" ',
         f'time="{time_s}" start="{start_s}" stale="{stale_s}" how="h-g-i-g-o">',
