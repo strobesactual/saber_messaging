@@ -15,6 +15,7 @@ import csv
 import json
 import sqlite3
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -124,8 +125,48 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 def _logged_now() -> str:
-    # Human-friendly stamp for CSV: DD MMM YY HH:MM:SS (UTC)
-    return datetime.now(timezone.utc).strftime("%d %b %y %H:%M:%S")
+    # Human-friendly stamp for CSV: DD MMM YY HH:MM:SSZ (UTC)
+    return datetime.now(timezone.utc).strftime("%d %b %y %H:%M:%SZ")
+
+
+_MIL_TZ_MAP = {
+    0: "Z",
+    1: "A", 2: "B", 3: "C", 4: "D", 5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "K", 11: "L", 12: "M",
+    -1: "N", -2: "O", -3: "P", -4: "Q", -5: "R", -6: "S", -7: "T", -8: "U", -9: "V", -10: "W", -11: "X", -12: "Y",
+}
+DEFAULT_LOCAL_LETTER = getattr(cfg, "DEFAULT_LOCAL_TZ_LETTER", "U")
+_TZ_OFFSET_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})([+-])(\d{2}):(\d{2})$")
+
+
+def _ensure_time_designators(ob: Dict[str, Any]) -> None:
+    """Ensure UTC/local/logged timestamps carry military designators."""
+    utc_val = str(ob.get("utc_time") or "").strip()
+    if utc_val and not utc_val.endswith("Z"):
+        ob["utc_time"] = f"{utc_val}Z"
+    else:
+        ob["utc_time"] = utc_val
+
+    local_val = str(ob.get("local_time") or "").strip()
+    if local_val:
+        if local_val[-1:].isalpha():
+            ob["local_time"] = local_val
+        else:
+            letter = None
+            m = _TZ_OFFSET_RE.match(local_val)
+            if m and m.group(4) == "00":
+                offset_hours = int(f"{m.group(2)}{m.group(3)}")
+                letter = _MIL_TZ_MAP.get(offset_hours)
+                if letter:
+                    ob["local_time"] = f"{m.group(1)}{letter}"
+                    return
+            # If a trailing offset letter isn't present, fall back to configured/default letter.
+            ob["local_time"] = f"{local_val}{DEFAULT_LOCAL_LETTER}"
+    else:
+        ob["local_time"] = local_val
+
+    logged_val = str(ob.get("logged") or "").strip()
+    if logged_val and not logged_val.endswith("Z"):
+        ob["logged"] = f"{logged_val}Z"
 
 def _parse_iso8601(ts: str | None):
     if not ts:
@@ -208,6 +249,24 @@ def _ensure_db() -> sqlite3.Connection:
         pass
     return con
 
+
+def _raw_exists_in_csv(raw_hex: str) -> bool:
+    """
+    Cheap guard so we don't skip logging when the dedupe tables already saw
+    a payload but the CSV row never got written (e.g., prior write error).
+    """
+    try:
+        if not CSV_LOG_PATH.exists():
+            return False
+        with CSV_LOG_PATH.open("r", newline="") as f:
+            for line in f:
+                if raw_hex in line:
+                    return True
+    except Exception:
+        # If we cannot read the CSV, fall back to assuming it does not have the row.
+        return False
+    return False
+
 # ----------------------------
 # CSV log (append-only)
 # ----------------------------
@@ -224,6 +283,7 @@ def _append_csv(ob: Dict[str, Any]) -> None:
     cid = str(ob.get("correlation_id") or "").strip()
     raw_hex = str(ob.get("raw") or "").strip()
     device_id = str(ob.get("device_id") or "").strip()
+    deduped = False
 
     con = None
     try:
@@ -237,7 +297,7 @@ def _append_csv(ob: Dict[str, Any]) -> None:
             con.commit()
             if con.total_changes == before:
                 # Already seen — skip CSV append
-                return
+                deduped = True
         # De-dupe CSV on (device_id, raw) for retransmits without correlation_id
         if device_id and raw_hex:
             if con is None:
@@ -249,13 +309,18 @@ def _append_csv(ob: Dict[str, Any]) -> None:
             )
             con.commit()
             if con.total_changes == before:
-                return
+                deduped = True
     finally:
         try:
             if con is not None:
                 con.close()
         except Exception:
             pass
+    if deduped and raw_hex and _raw_exists_in_csv(raw_hex):
+        return
+
+    if deduped:
+        logger.info("CSV append forced despite dedupe (raw not found in CSV) for device=%s", device_id)
     CSV_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fresh = not CSV_LOG_PATH.exists()
     with CSV_LOG_PATH.open("a", newline="") as f:
@@ -273,9 +338,11 @@ def _append_csv(ob: Dict[str, Any]) -> None:
             "Altitude (ft)": ob.get("alt_ft"),
             "Temp (C)": _temp_c_from_ob(ob),
             "Pressure (hPa)": ob.get("pressure_hpa"),
-            "Logged": _logged_now(),
+            "Logged": ob.get("logged") or _logged_now(),
             "Raw Message": ob.get("raw"),
         }
+        if row["Logged"] and not str(row["Logged"]).endswith("Z"):
+            row["Logged"] = f"{row['Logged']}Z"
         w.writerow(row)
 
 # ----------------------------
@@ -375,6 +442,9 @@ def record_observation(ob: Dict[str, Any]) -> bool:
     if not raw_hex.startswith("02"):
         logger.info("ignoring device=%s raw missing 0x02 header: %s", ob.get("device_id"), raw_hex[:8])
         return False
+
+    # Normalize time fields before persisting/logging
+    _ensure_time_designators(ob)
 
     # 1) CSV log (append-only)
     _append_csv(ob)

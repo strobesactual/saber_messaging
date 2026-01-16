@@ -29,14 +29,38 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 try:
+    from .. import config as cfg
+    _DEFAULT_LOCAL_TZ_LETTER = getattr(cfg, "DEFAULT_LOCAL_TZ_LETTER", "U")
+except Exception:
+    _DEFAULT_LOCAL_TZ_LETTER = "U"
+
+try:
     from timezonefinder import TimezoneFinder
     _tzf = TimezoneFinder()
 except Exception:
     _tzf = None
 
+_MIL_TZ_MAP = {
+    0: "Z",
+    1: "A", 2: "B", 3: "C", 4: "D", 5: "E", 6: "F", 7: "G", 8: "H", 9: "I", 10: "K", 11: "L", 12: "M",
+    -1: "N", -2: "O", -3: "P", -4: "Q", -5: "R", -6: "S", -7: "T", -8: "U", -9: "V", -10: "W", -11: "X", -12: "Y",
+}
+
+
+def _military_letter_for_dt(dt: datetime | None) -> str | None:
+    if dt is None or dt.utcoffset() is None:
+        return None
+    seconds = int(dt.utcoffset().total_seconds())
+    # Only support whole-hour offsets for the military designators
+    if seconds % 3600 != 0:
+        return None
+    return _MIL_TZ_MAP.get(seconds // 3600)
+
+
 def _hhmmss_from_cc(raw_u32: int) -> str:
     s = f"{raw_u32:08d}"[-8:]
     return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
+
 
 def _parse_fixed_payload(raw: bytes) -> dict:
     """
@@ -107,6 +131,19 @@ def _parse_fixed_payload(raw: bytes) -> dict:
         if local_dt is None:
             local_dt = utc_dt
 
+    utc_time_str = f"{utc_hms}Z" if utc_hms else ""
+    local_time_str = ""
+    if local_dt is not None:
+        local_time_str = local_dt.strftime("%H:%M:%S")
+        letter = _military_letter_for_dt(local_dt)
+        if not letter and local_dt.utcoffset() is not None:
+            seconds = int(local_dt.utcoffset().total_seconds())
+            if seconds % 3600 == 0:
+                letter = _MIL_TZ_MAP.get(seconds // 3600)
+        if not letter:
+            letter = _DEFAULT_LOCAL_TZ_LETTER
+        local_time_str += letter
+
     return {
         "device_id": "",
         "lat": lat if lat is not None else "",
@@ -116,9 +153,9 @@ def _parse_fixed_payload(raw: bytes) -> dict:
         "temp_k": temp_k if temp_k is not None else "",
         "temp_c": temp_c if temp_c is not None else "",
         "pressure_hpa": pressure_hpa if pressure_hpa is not None else "",
-        "utc_time": utc_hms,
+        "utc_time": utc_time_str,
         "local_date": local_dt.strftime("%d %b %y") if local_dt is not None else "",
-        "local_time": local_dt.strftime("%H:%M:%S") if local_dt is not None else "",
+        "local_time": local_time_str,
         "raw": raw.hex()
     }
 
